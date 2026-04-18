@@ -1,21 +1,35 @@
-"""Virtual mouse via Linux uinput. Creates a new HID device the OS treats as a real mouse.
+"""Virtual mouse.
 
-Requirements:
-  - /dev/uinput writable by current user (add to `input` group or chmod 666)
-  - python-evdev
+Linux-only: creates a new HID device via uinput that the OS treats as a real mouse.
+Requires /dev/uinput writable (add user to `input` group or `sudo chmod 666 /dev/uinput`).
 
-The physical mouse/trackpad keeps working — this is an ADDITIONAL pointing device.
+On non-Linux platforms, VirtualMouse() raises RuntimeError. The caller is expected to
+catch that and fall back to preview-only mode.
 """
 
-from evdev import UInput, ecodes as e
+import sys
+
+_IMPORT_ERROR: Exception | None = None
+try:
+    from evdev import UInput, ecodes as e
+except ImportError as exc:
+    _IMPORT_ERROR = exc
+    UInput = None  # type: ignore[assignment]
+    e = None  # type: ignore[assignment]
 
 
 class VirtualMouse:
     """Relative-motion virtual mouse. Call move(dx, dy) to nudge the cursor."""
 
-    BUTTON_CODES = {"left": e.BTN_LEFT, "right": e.BTN_RIGHT, "middle": e.BTN_MIDDLE}
-
     def __init__(self) -> None:
+        if _IMPORT_ERROR is not None:
+            raise RuntimeError(
+                f"evdev not available ({_IMPORT_ERROR}); cursor control needs Linux + evdev"
+            )
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("cursor control only works on Linux (uinput)")
+
+        self.BUTTON_CODES = {"left": e.BTN_LEFT, "right": e.BTN_RIGHT, "middle": e.BTN_MIDDLE}
         capabilities = {
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
             e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],

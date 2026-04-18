@@ -11,6 +11,8 @@ Latency notes:
     upscales for visibility.
 """
 
+import argparse
+import sys
 import threading
 import time
 
@@ -18,6 +20,14 @@ import cv2
 import mediapipe as mp
 
 from cursor import VirtualMouse
+
+
+def pick_capture_backend(os_name: str) -> int:
+    if os_name == "linux":
+        return cv2.CAP_V4L2
+    if os_name == "windows":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
 
 mp_pose = mp.solutions.pose
 mp_face = mp.solutions.face_mesh
@@ -75,10 +85,34 @@ class LatestFrameGrabber:
         self.thread.join(timeout=1.0)
 
 
+def parse_args() -> argparse.Namespace:
+    auto_os = "linux" if sys.platform.startswith("linux") else (
+        "windows" if sys.platform.startswith("win") else "other"
+    )
+    ap = argparse.ArgumentParser(description="Axis skeleton preview")
+    ap.add_argument(
+        "--os",
+        choices=["linux", "windows", "auto"],
+        default="auto",
+        help="Target OS. Chooses webcam backend and whether to enable cursor control. "
+        f"'auto' (default) detects at runtime: {auto_os}",
+    )
+    return ap.parse_args()
+
+
 def main() -> None:
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    args = parse_args()
+    os_name = args.os if args.os != "auto" else (
+        "linux" if sys.platform.startswith("linux") else (
+            "windows" if sys.platform.startswith("win") else "other"
+        )
+    )
+    print(f"OS: {os_name} (requested: {args.os})", flush=True)
+
+    backend = pick_capture_backend(os_name)
+    cap = cv2.VideoCapture(0, backend)
     if not cap.isOpened():
-        raise SystemExit("could not open webcam (/dev/video0)")
+        raise SystemExit(f"could not open webcam (backend={backend}, os={os_name})")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
@@ -99,15 +133,18 @@ def main() -> None:
     face = mp_face.FaceMesh(max_num_faces=1, refine_landmarks=False)
     hands = mp_hands.Hands(max_num_hands=2, model_complexity=0)
 
-    try:
-        mouse = VirtualMouse()
-        cursor_on = True
-        print("virtual mouse ready — point your index finger to move the cursor", flush=True)
-    except PermissionError:
-        mouse = None
-        cursor_on = False
-        print("WARN: /dev/uinput not writable — skipping cursor control. "
-              "Run: sudo chmod 0666 /dev/uinput", flush=True)
+    mouse = None
+    cursor_on = False
+    if os_name == "linux":
+        try:
+            mouse = VirtualMouse()
+            cursor_on = True
+            print("virtual mouse ready — point your index finger to move the cursor", flush=True)
+        except (PermissionError, RuntimeError) as exc:
+            print(f"WARN: cursor control disabled ({exc}). "
+                  "Run: sudo chmod 0666 /dev/uinput", flush=True)
+    else:
+        print(f"cursor control disabled on {os_name} — preview only", flush=True)
 
     prev_finger = None
     smoothed_dx = 0.0

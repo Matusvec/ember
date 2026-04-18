@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UserProfile",
+  "description": "Persisted calibration result for a single user. Written by the Signal pipeline after calibration confirmation. Read by the Driver runtime to validate that incoming gesture_ids are known.",
+  "type": "object",
+  "required": ["user_id", "gestures"],
+  "properties": {
+    "user_id": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "gestures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "confirmed"],
+        "properties": {
+          "id": { "type": "string" },
+          "confirmed": {
+            "type": "boolean",
+            "description": "User explicitly confirmed this gesture feels intentional."
+          },
+          "variance_score": {
+            "type": "number",
+            "description": "Score from the auto-discovery variance analysis. Higher = more reliably controllable."
+          },
+          "signature": {
+            "type": "object",
+            "description": "Opaque classifier-specific calibration data (thresholds, baseline landmark positions, etc)."
+          }
+        }
+      }
+    }
+  }
+}

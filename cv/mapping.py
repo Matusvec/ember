@@ -11,12 +11,41 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cursor import VirtualMouse
+
+
+def _detect_screen_size() -> tuple[int, int]:
+    """Best-effort screen size probe for edge-scroll bounds. Tries pyautogui
+    (works on X11 and X11-shim under Wayland), then xrandr, then a 1080p
+    fallback. Called once at dispatcher init — drift doesn't matter because
+    we re-clamp every frame."""
+    try:
+        import pyautogui  # type: ignore
+        w, h = pyautogui.size()
+        if w > 0 and h > 0:
+            return int(w), int(h)
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["xrandr", "--query"], capture_output=True, text=True, timeout=1,
+        ).stdout
+        for line in out.splitlines():
+            if " connected" in line and "primary" in line:
+                for token in line.split():
+                    if "x" in token and "+" in token:
+                        wxh = token.split("+", 1)[0]
+                        w_str, h_str = wxh.split("x")
+                        return int(w_str), int(h_str)
+    except Exception:
+        pass
+    return 1920, 1080
 
 
 @dataclass
@@ -103,6 +132,23 @@ class MappingDispatcher:
         from filters import OneEuroFilter
         self._make_filter = OneEuroFilter
 
+        # Tracked cursor position for edge-scroll. Updated on every mouse.move
+        # we emit and clamped to screen bounds. Starts at center; drift from
+        # other input devices is inconsequential because the edge logic only
+        # fires when tracked position sits AGAINST the bound for several
+        # frames in a row.
+        self._screen_w, self._screen_h = _detect_screen_size()
+        self._cur_x = self._screen_w // 2
+        self._cur_y = self._screen_h // 2
+
+        # Edge-scroll tuning. Cursor within EDGE_ZONE px of an edge fires
+        # wheel events every EDGE_INTERVAL / intensity seconds, where
+        # intensity = depth_into_zone / EDGE_ZONE. So "barely at the edge"
+        # scrolls slowly; "slammed against it" scrolls fast.
+        self._edge_zone = int(os.getenv("EMBER_EDGE_ZONE_PX", "40"))
+        self._edge_interval = float(os.getenv("EMBER_EDGE_INTERVAL_S", "0.12"))
+        self._last_edge_scroll = 0.0
+
     def dispatch(self, sources: dict[str, Any], now: float) -> list[str]:
         """Apply all enabled bindings.  Returns list of event labels fired (for UI)."""
         events: list[str] = []
@@ -148,6 +194,7 @@ class MappingDispatcher:
                 # Stub — to wire up once we add virtual keyboard support.
                 continue
 
+        self._check_edge_scroll(now, events)
         return events
 
     # ---- helpers ----
@@ -189,6 +236,8 @@ class MappingDispatcher:
             st["rem_y"] = move_y - int_y
             if abs(int_x) >= 1 or abs(int_y) >= 1:
                 self.mouse.move(int_x, int_y)
+                self._cur_x = max(0, min(self._screen_w, self._cur_x + int_x))
+                self._cur_y = max(0, min(self._screen_h, self._cur_y + int_y))
 
         st["prev"] = smooth
         st["last_seen"] = now
@@ -230,3 +279,25 @@ class MappingDispatcher:
             if b.action == "left_press":
                 self.mouse.release("left")
             self._button_held[b.id] = False
+
+    def _check_edge_scroll(self, now: float, events: list[str]) -> None:
+        """If the tracked cursor is parked against a screen edge, emit wheel
+        events. Top edge scrolls up, bottom scrolls down. Rate scales with
+        how deep the cursor sits in the edge zone."""
+        if self.mouse is None:
+            return
+        zone = self._edge_zone
+        # Depth into each edge zone (0 = not in zone, up to `zone` = slammed).
+        top_depth    = max(0, zone - self._cur_y)
+        bottom_depth = max(0, self._cur_y - (self._screen_h - zone))
+        if top_depth == 0 and bottom_depth == 0:
+            return
+        intensity = min(1.0, max(top_depth, bottom_depth) / max(1, zone))
+        # Faster when deeper — clamp to a hard floor so gentle edge-rest still ticks.
+        interval = self._edge_interval / max(0.35, intensity)
+        if now - self._last_edge_scroll < interval:
+            return
+        clicks = 1 if top_depth > bottom_depth else -1
+        self.mouse.scroll(clicks)
+        self._last_edge_scroll = now
+        events.append(f"edge→scroll_{'up' if clicks > 0 else 'down'}")

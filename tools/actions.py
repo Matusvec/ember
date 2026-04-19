@@ -104,6 +104,30 @@ TOOL_SCHEMAS = [
     },
     {
         "type": "client",
+        "name": "press_key",
+        "description": (
+            "Press a named key or modifier chord. Use for Enter, Delete, "
+            "Backspace, Tab, Escape, Home/End, Page Up/Down, arrow keys, "
+            "F1-F12, and modifier combos like 'ctrl+c', 'ctrl+shift+t', "
+            "'alt+tab', 'super+l'. Prefer type_text for typing literal text; "
+            "use this for single control keys and shortcuts."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["key"],
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": (
+                        "Key name ('enter', 'delete', 'up', 'f5') or chord "
+                        "('ctrl+c', 'alt+tab'). Case-insensitive."
+                    ),
+                }
+            },
+        },
+    },
+    {
+        "type": "client",
         "name": "launch_app",
         "description": "Open an application by name (Chrome, Firefox, Slack, etc). Falls back to xdg-open for anything not in the known list.",
         "parameters": {
@@ -194,7 +218,14 @@ _APP_COMMANDS: dict[str, list[str]] = {
     "brave":         ["brave-browser", "brave"],
     "firefox":       ["firefox", "firefox-esr"],
     "browser":       ["xdg-open", "firefox", "google-chrome", "chromium"],
-    "terminal":      ["alacritty", "kitty", "gnome-terminal", "konsole", "xterm"],
+    "terminal":      ["kgx", "ptyxis", "alacritty", "kitty", "foot", "wezterm",
+                      "ghostty", "gnome-terminal", "konsole", "tilix",
+                      "terminator", "xfce4-terminal", "mate-terminal",
+                      "lxterminal", "xterm"],
+    "console":       ["kgx", "ptyxis", "alacritty", "kitty", "foot", "wezterm",
+                      "ghostty", "gnome-terminal", "konsole", "xterm"],
+    "shell":         ["kgx", "ptyxis", "alacritty", "kitty", "foot", "wezterm",
+                      "ghostty", "gnome-terminal", "konsole", "xterm"],
     "slack":         ["slack"],
     "discord":       ["discord"],
     "code":          ["code", "code-oss", "codium"],
@@ -269,6 +300,7 @@ class ActionDispatcher:
             "click":          self._tool_click,
             "scroll":         self._tool_scroll,
             "type_text":      self._tool_type_text,
+            "press_key":      self._tool_press_key,
             "launch_app":     self._tool_launch_app,
             "search_web":     self._tool_search_web,
             "keyboard":       self._tool_keyboard,
@@ -335,31 +367,55 @@ class ActionDispatcher:
         ))
         return f"Typed {count} characters."
 
+    def _tool_press_key(self, key: str) -> str:
+        chord = (key or "").strip()
+        if not chord:
+            return "No key specified."
+        if self._vi is not None and hasattr(self._vi, "press_chord"):
+            try:
+                self._vi.press_chord(chord)
+            except ValueError as exc:
+                return f"Unsupported key: {exc}"
+            self._history.append(UndoRecord(
+                tool="press_key",
+                description=f"Pressed {chord}",
+                reverse_fn=None,
+            ))
+            return f"Pressed {chord}."
+        if _HAS_PYAUTOGUI:
+            parts = [p.strip().lower() for p in chord.replace(" ", "+").split("+") if p.strip()]
+            try:
+                pyautogui.hotkey(*parts)
+            except Exception as exc:
+                return f"Key press failed: {exc}"
+            return f"Pressed {chord}."
+        return "Key press unavailable: no virtual input backend."
+
     def _tool_launch_app(self, name: str) -> str:
-        key = name.lower().strip()
-        candidates = _APP_COMMANDS.get(key, [])
-        # xdg-open fallback handles anything the user has registered a default
-        # handler for (including arbitrary URIs, .desktop names, etc).
-        if shutil.which("xdg-open"):
-            candidates = list(candidates) + [f"xdg-open:{key}"]
+        raw = (name or "").strip()
+        if not raw:
+            return "No app specified."
+        key = raw.lower()
+        # Candidates in priority order: curated aliases, then the literal name
+        # (handles any binary on PATH like 'htop', 'nvim', 'blender', a full
+        # path, or a command with arguments like 'bash -c "..."').
+        candidates = list(_APP_COMMANDS.get(key, []))
+        if raw not in candidates:
+            candidates.append(raw)
 
         last_err: Optional[str] = None
         for cmd in candidates:
-            if cmd.startswith("xdg-open:"):
-                target = cmd.split(":", 1)[1]
-                # xdg-open only accepts URIs or existing files — if the user
-                # said "firefox" it won't resolve. Only try this when nothing
-                # else worked AND the target looks like a URL.
-                if not (target.startswith("http") or target.startswith("file:")):
-                    continue
-                exe = "xdg-open"
-                args = [exe, target]
-            else:
-                exe = cmd
-                args = [exe]
-            if not shutil.which(exe):
+            # Accept either a single executable name or a full command line
+            # with arguments ('firefox --new-window', 'bash -lc "ls"').
+            args = cmd.split() if isinstance(cmd, str) else list(cmd)
+            if not args:
+                continue
+            exe = args[0]
+            resolved = shutil.which(exe)
+            if not resolved:
                 last_err = f"{exe} not on PATH"
                 continue
+            args[0] = resolved
             try:
                 subprocess.Popen(
                     args,
@@ -369,15 +425,34 @@ class ActionDispatcher:
                 )
                 self._history.append(UndoRecord(
                     tool="launch_app",
-                    description=f"Launched {name}",
+                    description=f"Launched {raw}",
                     reverse_fn=None,
                 ))
-                return f"Opening {name}."
+                return f"Opening {raw}."
             except Exception as exc:
                 last_err = str(exc)
                 continue
+
+        # Last resort: xdg-open for URIs or .desktop entries (e.g. URLs).
+        if shutil.which("xdg-open") and (raw.startswith("http") or raw.startswith("file:")):
+            try:
+                subprocess.Popen(
+                    ["xdg-open", raw],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._history.append(UndoRecord(
+                    tool="launch_app",
+                    description=f"Opened {raw} via xdg-open",
+                    reverse_fn=None,
+                ))
+                return f"Opening {raw}."
+            except Exception as exc:
+                last_err = str(exc)
+
         detail = f" ({last_err})" if last_err else ""
-        return f"{name} doesn't appear to be installed{detail}."
+        return f"{raw} doesn't appear to be installed{detail}."
 
     def _tool_search_web(self, query: str, engine: str = "google") -> str:
         template = _SEARCH_URLS.get(engine.lower(), _SEARCH_URLS["google"])

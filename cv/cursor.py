@@ -50,6 +50,58 @@ def _build_keymap():
     return km
 
 
+def _build_named_keys() -> dict[str, int]:
+    """Named keys the agent can press via press_key. Keys are normalized to
+    lowercase; spoken variants ('return', 'space', 'esc') alias to canonical
+    evdev codes."""
+    if e is None:
+        return {}
+    nk: dict[str, int] = {
+        # editing + navigation
+        "enter": e.KEY_ENTER, "return": e.KEY_ENTER,
+        "escape": e.KEY_ESC, "esc": e.KEY_ESC,
+        "tab": e.KEY_TAB,
+        "space": e.KEY_SPACE, "spacebar": e.KEY_SPACE,
+        "backspace": e.KEY_BACKSPACE, "delete": e.KEY_DELETE, "del": e.KEY_DELETE,
+        "insert": e.KEY_INSERT, "ins": e.KEY_INSERT,
+        "home": e.KEY_HOME, "end": e.KEY_END,
+        "pageup": e.KEY_PAGEUP, "page_up": e.KEY_PAGEUP, "pgup": e.KEY_PAGEUP,
+        "pagedown": e.KEY_PAGEDOWN, "page_down": e.KEY_PAGEDOWN, "pgdn": e.KEY_PAGEDOWN,
+        # arrows
+        "up": e.KEY_UP, "down": e.KEY_DOWN,
+        "left": e.KEY_LEFT, "right": e.KEY_RIGHT,
+        # media / system
+        "caps": e.KEY_CAPSLOCK, "capslock": e.KEY_CAPSLOCK,
+        "menu": e.KEY_MENU, "super": e.KEY_LEFTMETA, "meta": e.KEY_LEFTMETA,
+        "win": e.KEY_LEFTMETA, "windows": e.KEY_LEFTMETA,
+        "printscreen": e.KEY_SYSRQ, "prtsc": e.KEY_SYSRQ,
+        "volumeup": e.KEY_VOLUMEUP, "volumedown": e.KEY_VOLUMEDOWN,
+        "mute": e.KEY_MUTE,
+        "play": e.KEY_PLAYPAUSE, "playpause": e.KEY_PLAYPAUSE,
+        "next": e.KEY_NEXTSONG, "prev": e.KEY_PREVIOUSSONG, "previous": e.KEY_PREVIOUSSONG,
+    }
+    # F1..F24
+    for i in range(1, 25):
+        code = getattr(e, f"KEY_F{i}", None)
+        if code is not None:
+            nk[f"f{i}"] = code
+    return nk
+
+
+_MODIFIERS = {
+    "ctrl":    "KEY_LEFTCTRL",
+    "control": "KEY_LEFTCTRL",
+    "alt":     "KEY_LEFTALT",
+    "option":  "KEY_LEFTALT",
+    "shift":   "KEY_LEFTSHIFT",
+    "super":   "KEY_LEFTMETA",
+    "meta":    "KEY_LEFTMETA",
+    "win":     "KEY_LEFTMETA",
+    "cmd":     "KEY_LEFTMETA",
+    "windows": "KEY_LEFTMETA",
+}
+
+
 class VirtualMouse:
     """Relative-motion virtual mouse + keyboard. Call move(dx, dy) to nudge
     the cursor, type(text) to emit keystrokes for arbitrary ASCII text."""
@@ -64,10 +116,18 @@ class VirtualMouse:
 
         self.BUTTON_CODES = {"left": e.BTN_LEFT, "right": e.BTN_RIGHT, "middle": e.BTN_MIDDLE}
         self._keymap = _build_keymap()
-        # Include every keycode we'll ever emit plus shift.
-        keyboard_keys = list({kc for kc, _ in self._keymap.values()}) + [
-            e.KEY_LEFTSHIFT, e.KEY_BACKSPACE, e.KEY_ENTER, e.KEY_TAB,
-        ]
+        self._named_keys = _build_named_keys()
+        # Resolve modifier keycodes once at construction time.
+        self._modifier_codes = {
+            name: getattr(e, code_name)
+            for name, code_name in _MODIFIERS.items()
+        }
+        # Register every keycode the device may ever emit: ASCII typewrite,
+        # named keys (Enter/arrows/F-keys/...), all modifiers.
+        ascii_codes = {kc for kc, _ in self._keymap.values()}
+        named_codes = set(self._named_keys.values())
+        modifier_codes = set(self._modifier_codes.values())
+        keyboard_keys = list(ascii_codes | named_codes | modifier_codes)
         capabilities = {
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE] + keyboard_keys,
             e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
@@ -140,6 +200,55 @@ class VirtualMouse:
         self.ui.syn()
         self.ui.write(e.EV_KEY, keycode, 0)
         self.ui.syn()
+
+    def press_chord(self, chord: str) -> None:
+        """Press a named key or modifier+key chord. Accepts forms like:
+            'enter', 'Delete', 'Ctrl+C', 'ctrl + shift + t', 'alt+f4',
+            'super+d', 'F5', 'page up'.
+        Unknown tokens raise ValueError so the agent gets a clear error back.
+        """
+        parts = [p.strip().lower() for p in chord.replace(" ", "+").split("+") if p.strip()]
+        if not parts:
+            raise ValueError(f"empty key chord: {chord!r}")
+
+        mod_codes: list[int] = []
+        key_code: int | None = None
+        shift_for_char = False
+        for token in parts:
+            if token in self._modifier_codes:
+                mod_codes.append(self._modifier_codes[token])
+                continue
+            if key_code is not None:
+                raise ValueError(f"chord has more than one non-modifier key: {chord!r}")
+            # Try named key first, then single printable char (via ASCII keymap).
+            if token in self._named_keys:
+                key_code = self._named_keys[token]
+            elif len(token) == 1:
+                entry = self._keymap.get(token) or self._keymap.get(token.lower())
+                if entry is None:
+                    raise ValueError(f"unsupported key: {token!r} in chord {chord!r}")
+                key_code, shift_for_char = entry
+            else:
+                raise ValueError(f"unsupported key name: {token!r} in chord {chord!r}")
+        if key_code is None:
+            # Chord was pure modifiers; treat last modifier as the key press.
+            key_code = mod_codes.pop()
+
+        # Shift needed by the ASCII entry (e.g. 'Ctrl+?') adds to modifier list.
+        if shift_for_char and e.KEY_LEFTSHIFT not in mod_codes:
+            mod_codes.append(e.KEY_LEFTSHIFT)
+
+        # Press modifiers → tap key → release modifiers in reverse.
+        for code in mod_codes:
+            self.ui.write(e.EV_KEY, code, 1)
+            self.ui.syn()
+        self.ui.write(e.EV_KEY, key_code, 1)
+        self.ui.syn()
+        self.ui.write(e.EV_KEY, key_code, 0)
+        self.ui.syn()
+        for code in reversed(mod_codes):
+            self.ui.write(e.EV_KEY, code, 0)
+            self.ui.syn()
 
     def close(self) -> None:
         for button in list(self._held):

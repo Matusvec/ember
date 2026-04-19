@@ -24,9 +24,17 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Optional
 
-import pyautogui
-
-pyautogui.FAILSAFE = False  # disable corner-of-screen interrupt for accessibility use
+# pyautogui may fail to import on Wayland (tries to connect to X11 at module load).
+# Guard it so the voice pipeline can still be wired to the matus VirtualMouse without
+# pyautogui being functional.  Every call site below checks _HAS_PYAUTOGUI first.
+try:
+    import pyautogui  # type: ignore
+    pyautogui.FAILSAFE = False
+    _HAS_PYAUTOGUI = True
+except Exception as _pyag_exc:  # pragma: no cover
+    pyautogui = None  # type: ignore
+    _HAS_PYAUTOGUI = False
+    _PYAUTOGUI_IMPORT_ERROR = _pyag_exc
 
 
 # ─── Tool schemas (ElevenLabs Conversational AI client tool format) ──────────
@@ -176,7 +184,13 @@ class ActionDispatcher:
         self._vi = virtual_input         # matus VirtualMouse, or None for pyautogui
         self._narrate = narrate_fn       # async fn() → str, set by VoiceBridge
         self._history: Deque[UndoRecord] = deque(maxlen=20)
-        self._screen_w, self._screen_h = pyautogui.size()
+        if _HAS_PYAUTOGUI:
+            self._screen_w, self._screen_h = pyautogui.size()
+        else:
+            # Default fallback when pyautogui isn't available (e.g. Wayland).
+            # move_cursor uses normalized regions so exact screen size is only
+            # required when pyautogui is the backend.
+            self._screen_w, self._screen_h = 1920, 1080
 
     # ── Interface for ElevenLabs client_tools ────────────────────────────────
 
@@ -210,7 +224,10 @@ class ActionDispatcher:
     # ── Tool handlers (synchronous — ElevenLabs requires sync client_tools) ──
 
     def _tool_move_cursor(self, region: str) -> str:
-        prev_x, prev_y = pyautogui.position() if self._vi is None else (0, 0)
+        if self._vi is None and _HAS_PYAUTOGUI:
+            prev_x, prev_y = pyautogui.position()
+        else:
+            prev_x, prev_y = 0, 0
         x, y = self._region_to_coords(region)
         self._move(x, y)
         self._history.append(UndoRecord(
@@ -305,25 +322,25 @@ class ActionDispatcher:
     def _move(self, x: int, y: int) -> None:
         if self._vi:
             self._vi.move(x, y)
-        else:
+        elif _HAS_PYAUTOGUI:
             pyautogui.moveTo(x, y, duration=0.12)
 
     def _click(self, button: str = "left") -> None:
         if self._vi:
             self._vi.click(button)
-        else:
+        elif _HAS_PYAUTOGUI:
             pyautogui.click(button=button)
 
     def _scroll(self, clicks: int) -> None:
         if self._vi:
             self._vi.scroll(clicks)
-        else:
+        elif _HAS_PYAUTOGUI:
             pyautogui.scroll(clicks)
 
     def _type(self, text: str) -> None:
         if self._vi:
             self._vi.type(text)
-        else:
+        elif _HAS_PYAUTOGUI:
             pyautogui.typewrite(text, interval=0.02)
 
     # ── Screen region math ───────────────────────────────────────────────────

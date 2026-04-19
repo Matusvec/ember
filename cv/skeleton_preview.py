@@ -3,6 +3,9 @@
 Run:  python cv/skeleton_preview.py
 Quit: press q in the video window
 
+Bindings (which gesture does what) are in mapping.json at the repo root.
+Edit that file while this is running — changes are picked up on the next frame.
+
 Latency notes:
   - V4L2 buffers up to 4 frames by default (~130ms at 30fps). We drop buffer to 1.
   - A grabber thread keeps only the latest frame, so the main loop never reads stale data.
@@ -12,60 +15,23 @@ Latency notes:
 """
 
 import argparse
-import math
 import sys
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
 
 from cursor import VirtualMouse
-
-
-class OneEuroFilter:
-    """1-Euro filter — adaptive low-pass for pointer tracking.
-
-    Filters hard when the signal is still (kills jitter) and lets fast motion
-    through cleanly (stays responsive). Originally from Casiez, Roussel, Vogel 2012.
-
-    https://gery.casiez.net/1euro/
-    """
-
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.05, d_cutoff: float = 1.0) -> None:
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self.x_prev: float | None = None
-        self.dx_prev: float = 0.0
-        self.t_prev: float | None = None
-
-    @staticmethod
-    def _alpha(cutoff: float, dt: float) -> float:
-        r = 2 * math.pi * cutoff * dt
-        return r / (r + 1)
-
-    def filter(self, x: float, t: float) -> float:
-        if self.t_prev is None or self.x_prev is None:
-            self.t_prev = t
-            self.x_prev = x
-            return x
-        dt = max(t - self.t_prev, 1e-6)
-        dx = (x - self.x_prev) / dt
-        a_d = self._alpha(self.d_cutoff, dt)
-        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
-        a = self._alpha(cutoff, dt)
-        x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        self.t_prev = t
-        return x_hat
-
-    def reset(self) -> None:
-        self.x_prev = None
-        self.dx_prev = 0.0
-        self.t_prev = None
+from mapping import MappingConfig, MappingDispatcher
+from sources import (
+    eye_aspect_ratio,
+    eyebrow_raise,
+    index_tip,
+    mouth_ratio,
+    nose_tip,
+)
 
 
 def pick_capture_backend(os_name: str) -> int:
@@ -74,6 +40,7 @@ def pick_capture_backend(os_name: str) -> int:
     if os_name == "windows":
         return cv2.CAP_DSHOW
     return cv2.CAP_ANY
+
 
 mp_pose = mp.solutions.pose
 mp_face = mp.solutions.face_mesh
@@ -85,27 +52,8 @@ WIN = "Axis - skeleton preview"
 CAP_W, CAP_H = 640, 480
 DISPLAY_W, DISPLAY_H = 1280, 720
 
-CURSOR_SENSITIVITY = 2500
-INDEX_TIP = 8
-
-# One-Euro filter tuning.  Lower min_cutoff = smoother when still (more latency).
-# Higher beta = more responsive when moving fast.
-FILTER_MIN_CUTOFF = 1.0
-FILTER_BETA = 0.05
-
-# If the hand disappears for longer than this, wipe filter state so the cursor
-# does not "snap" when the hand reappears in a new location.
-DROPOUT_RESET_S = 0.3
-
-# Pixel-level dead zone.  Tiny sub-pixel deltas are dropped, killing residual
-# jitter without accumulating error (fractional remainder is carried forward).
-CURSOR_DEAD_ZONE_PX = 1
-
-UPPER_LIP = 13
-LOWER_LIP = 14
-FOREHEAD = 10
-CHIN = 152
-MOUTH_OPEN_THRESHOLD = 0.08
+# Relative to the repo root.  Preview is run from repo root, so this resolves.
+DEFAULT_MAPPING_PATH = Path(__file__).resolve().parent.parent / "mapping.json"
 
 
 class LatestFrameGrabber:
@@ -154,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         help="Target OS. Chooses webcam backend and whether to enable cursor control. "
         f"'auto' (default) detects at runtime: {auto_os}",
     )
+    ap.add_argument(
+        "--mapping",
+        default=str(DEFAULT_MAPPING_PATH),
+        help="Path to mapping.json (default: %(default)s)",
+    )
     return ap.parse_args()
 
 
@@ -191,25 +144,21 @@ def main() -> None:
     hands = mp_hands.Hands(max_num_hands=2, model_complexity=0)
 
     mouse = None
-    cursor_on = False
+    dispatcher_enabled = False
     if os_name == "linux":
         try:
             mouse = VirtualMouse()
-            cursor_on = True
-            print("virtual mouse ready — point your index finger to move the cursor", flush=True)
+            dispatcher_enabled = True
+            print("virtual mouse ready", flush=True)
         except (PermissionError, RuntimeError) as exc:
             print(f"WARN: cursor control disabled ({exc}). "
                   "Run: sudo chmod 0666 /dev/uinput", flush=True)
     else:
         print(f"cursor control disabled on {os_name} — preview only", flush=True)
 
-    filter_x = OneEuroFilter(min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
-    filter_y = OneEuroFilter(min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
-    prev_smooth = None
-    remainder_x = 0.0
-    remainder_y = 0.0
-    last_detect_t = 0.0
-    mouth_was_open = False
+    config = MappingConfig(args.mapping)
+    dispatcher = MappingDispatcher(config, mouse)
+
     last = time.monotonic()
     fps_ema = 0.0
 
@@ -236,8 +185,6 @@ def main() -> None:
                     landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style(),
                 )
 
-            mouth_ratio = 0.0
-            mouth_is_open = False
             if face_res.multi_face_landmarks:
                 for face_lms in face_res.multi_face_landmarks:
                     mp_drawing.draw_landmarks(
@@ -254,13 +201,7 @@ def main() -> None:
                         landmark_drawing_spec=None,
                         connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
                     )
-                lms = face_res.multi_face_landmarks[0].landmark
-                mouth_gap = abs(lms[LOWER_LIP].y - lms[UPPER_LIP].y)
-                face_h = abs(lms[CHIN].y - lms[FOREHEAD].y)
-                mouth_ratio = mouth_gap / face_h if face_h > 1e-6 else 0.0
-                mouth_is_open = mouth_ratio > MOUTH_OPEN_THRESHOLD
 
-            index_tip = None
             if hands_res.multi_hand_landmarks:
                 for hand_lms in hands_res.multi_hand_landmarks:
                     mp_drawing.draw_landmarks(
@@ -270,63 +211,76 @@ def main() -> None:
                         mp_styles.get_default_hand_landmarks_style(),
                         mp_styles.get_default_hand_connections_style(),
                     )
-                tip = hands_res.multi_hand_landmarks[0].landmark[INDEX_TIP]
-                index_tip = (tip.x, tip.y)
-                h, w = frame.shape[:2]
-                cv2.circle(frame, (int(tip.x * w), int(tip.y * h)), 12, (0, 255, 255), 2)
+
+            # Extract source values for the dispatcher.
+            sources_dict = {
+                "nose": nose_tip(face_res.multi_face_landmarks),
+                "index_tip": index_tip(hands_res.multi_hand_landmarks),
+                "mouth": mouth_ratio(face_res.multi_face_landmarks),
+                "ear": eye_aspect_ratio(face_res.multi_face_landmarks, "both"),
+                "brow": eyebrow_raise(face_res.multi_face_landmarks),
+            }
 
             now = time.monotonic()
+            config.maybe_reload()
+            events = dispatcher.dispatch(sources_dict, now) if dispatcher_enabled else []
 
-            if mouse is not None and cursor_on and index_tip is not None:
-                if now - last_detect_t > DROPOUT_RESET_S:
-                    filter_x.reset()
-                    filter_y.reset()
-                    prev_smooth = None
-                    remainder_x = remainder_y = 0.0
+            # ── Visual overlays for active signals ────────────────────────────
+            h, w = frame.shape[:2]
 
-                sx = filter_x.filter(index_tip[0], now)
-                sy = filter_y.filter(index_tip[1], now)
-                smooth = (sx, sy)
+            if sources_dict["nose"] is not None:
+                nx, ny = sources_dict["nose"]
+                cv2.circle(frame, (int(nx * w), int(ny * h)), 8, (0, 200, 255), 2)
+                cv2.drawMarker(
+                    frame, (int(nx * w), int(ny * h)),
+                    (0, 200, 255), cv2.MARKER_CROSS, 18, 1,
+                )
 
-                if prev_smooth is not None:
-                    move_x = (smooth[0] - prev_smooth[0]) * CURSOR_SENSITIVITY + remainder_x
-                    move_y = (smooth[1] - prev_smooth[1]) * CURSOR_SENSITIVITY + remainder_y
-                    int_x = int(move_x)
-                    int_y = int(move_y)
-                    remainder_x = move_x - int_x
-                    remainder_y = move_y - int_y
-                    if abs(int_x) >= CURSOR_DEAD_ZONE_PX or abs(int_y) >= CURSOR_DEAD_ZONE_PX:
-                        mouse.move(int_x, int_y)
+            if sources_dict["index_tip"] is not None:
+                ix, iy = sources_dict["index_tip"]
+                cv2.circle(frame, (int(ix * w), int(iy * h)), 12, (0, 255, 255), 2)
 
-                prev_smooth = smooth
-                last_detect_t = now
-            if mouse is not None and cursor_on:
-                if mouth_is_open and not mouth_was_open:
-                    mouse.press("left")
-                elif not mouth_is_open and mouth_was_open:
-                    mouse.release("left")
-            elif mouse is not None and not cursor_on and mouth_was_open:
-                mouse.release("left")
-            mouth_was_open = mouth_is_open
+            ear = sources_dict["ear"]
+            brow = sources_dict["brow"]
+            ear_text = f"EAR {ear:.2f}" if ear is not None else "EAR —"
+            brow_text = f"BROW {brow:.2f}" if brow is not None else "BROW —"
 
-            if mouth_is_open and mouse is not None and cursor_on:
-                h, w = frame.shape[:2]
-                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
+            blink_fired = any(e.startswith("blink") for e in events)
+            brow_fired = any(e.startswith("brow") for e in events)
+            mouth_hold = any(e.startswith("mouth") for e in events)
+
+            if blink_fired:
+                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (255, 100, 0), 6)
                 cv2.putText(
-                    frame, "HOLDING CLICK", (12, 60),
+                    frame, "BLINK CLICK", (12, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2, cv2.LINE_AA,
+                )
+            if brow_fired:
+                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 255, 255), 6)
+                cv2.putText(
+                    frame, "BROW CLICK", (12, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA,
+                )
+            if mouth_hold:
+                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
+                cv2.putText(
+                    frame, "MOUTH HOLD", (12, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA,
                 )
 
             inst_fps = 1.0 / max(now - last, 1e-6)
             last = now
             fps_ema = inst_fps if fps_ema == 0.0 else 0.9 * fps_ema + 0.1 * inst_fps
-            status = "cursor ON" if (mouse and cursor_on) else "cursor OFF"
+
+            enabled_count = sum(1 for b in config.bindings if b.enabled)
+            disp_state = "ON" if (mouse and dispatcher_enabled) else "OFF"
             cv2.putText(
                 frame,
-                f"{fps_ema:5.1f} fps   {status}   [c] toggle  [q] quit",
+                f"{fps_ema:5.1f} fps   dispatcher {disp_state}   "
+                f"{enabled_count} bindings   {ear_text}   {brow_text}   [d] toggle  [q] quit",
                 (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.55,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA,
@@ -336,12 +290,15 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
-            if key == ord("c") and mouse is not None:
-                cursor_on = not cursor_on
-                filter_x.reset()
-                filter_y.reset()
-                prev_smooth = None
-                remainder_x = remainder_y = 0.0
+            if key == ord("d") and mouse is not None:
+                dispatcher_enabled = not dispatcher_enabled
+                if not dispatcher_enabled:
+                    # release any held buttons cleanly
+                    for btn in ("left", "right", "middle"):
+                        try:
+                            mouse.release(btn)
+                        except Exception:
+                            pass
     finally:
         grabber.stop()
         cap.release()

@@ -54,21 +54,19 @@ class WakeWordDetector:
         self._active      = False   # suppresses re-trigger during a live session
 
     def start(self) -> None:
-        if not _PORCUPINE_AVAILABLE:
-            print("[WakeWord] pvporcupine not installed — keyboard fallback active.")
-            print("[WakeWord] Press ENTER at any time to trigger voice mode.")
+        if not _PORCUPINE_AVAILABLE or not PICOVOICE_ACCESS_KEY:
+            reason = "pvporcupine not installed" if not _PORCUPINE_AVAILABLE \
+                else "PICOVOICE_ACCESS_KEY not set"
+            print(f"[WakeWord] {reason} — keyboard fallback active.")
+            print("[WakeWord] Press ENTER in this terminal to start a voice session.")
             target = self._keyboard_loop
+            kw = "<ENTER key>"
         else:
-            if not PICOVOICE_ACCESS_KEY:
-                raise EnvironmentError(
-                    "PICOVOICE_ACCESS_KEY is not set. "
-                    "Get a free key at console.picovoice.ai and add it to .env"
-                )
             target = self._porcupine_loop
+            kw = _CUSTOM_KEYWORD_PATH or _BUILTIN_KEYWORD
 
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
-        kw = _CUSTOM_KEYWORD_PATH or _BUILTIN_KEYWORD
         print(f"[WakeWord] Listening for: {kw}")
 
     def stop(self) -> None:

@@ -91,7 +91,7 @@ async def synthesize_stream(text: str) -> AsyncGenerator[bytes, None]:
     start playing before the full sentence is generated.
     """
     client = get_client()
-    async for chunk in await client.text_to_speech.convert_as_stream(
+    async for chunk in client.text_to_speech.stream(
         text=text,
         voice_id=VOICE_ID,
         model_id=MODEL_ID,

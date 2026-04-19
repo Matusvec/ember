@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  body {
+    background:
+      radial-gradient(1200px 600px at 50% -10%, rgba(242,139,58,0.08), transparent 70%),
+      radial-gradient(800px 400px at 110% 110%, rgba(184,93,23,0.06), transparent 70%),
+      #0b0a09;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl bg-card/70 backdrop-blur-xl border border-border/70 shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl
+           px-5 py-3 font-medium transition-colors
+           focus:outline-none focus-visible:ring-2 focus-visible:ring-ember/60;
+  }
+  .btn-primary {
+    @apply bg-ember text-black hover:bg-ember-soft;
+  }
+  .btn-ghost {
+    @apply bg-card/40 text-text hover:bg-card border border-border/60;
+  }
+  .chip {
+    @apply inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs
+           bg-card/60 border border-border/60 text-muted;
+  }
+  .meter-track {
+    @apply h-2 w-full rounded-full bg-border/40 overflow-hidden;
+  }
+  .meter-fill {
+    @apply h-full rounded-full transition-[width] duration-100;
+  }
+}
+
+/* Hide default scrollbars on the main viewport — looks more app-like */
+html, body { overflow: hidden; }

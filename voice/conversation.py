@@ -26,7 +26,11 @@ import threading
 from typing import Callable, Optional
 
 from elevenlabs.client import ElevenLabs
-from elevenlabs.conversational_ai.conversation import Conversation
+from elevenlabs.conversational_ai.conversation import (
+    ClientTools,
+    Conversation,
+    ConversationInitiationData,
+)
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
 
 from tools.actions import ActionDispatcher, TOOL_SCHEMAS
@@ -82,16 +86,17 @@ class AxisConversation:
 
         client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
-        self._conv = Conversation(
-            client=client,
-            agent_id=AGENT_ID,
-            requires_auth=bool(os.getenv("ELEVENLABS_API_KEY")),
-            audio_interface=DefaultAudioInterface(),
-            callback_agent_response=self._cb_agent_response,
-            callback_user_transcript=self._cb_user_transcript,
-            callback_latency_measurement=lambda ms: print(f"[ConvAI] {ms}ms"),
-            client_tools=self._dispatcher.get_client_tools(),
-            override_agent_config={
+        # New SDK: wrap each handler to take a single dict of params.
+        ct = ClientTools()
+        def _wrap(fn):
+            def _inner(params: dict):
+                return fn(**(params or {}))
+            return _inner
+        for name, handler in self._dispatcher.get_client_tools().items():
+            ct.register(name, _wrap(handler))
+
+        init = ConversationInitiationData(
+            conversation_config_override={
                 "agent": {
                     "prompt": {
                         "prompt": SYSTEM_PROMPT,
@@ -101,6 +106,18 @@ class AxisConversation:
                     "language": "en",
                 }
             },
+        )
+
+        self._conv = Conversation(
+            client=client,
+            agent_id=AGENT_ID,
+            requires_auth=bool(os.getenv("ELEVENLABS_API_KEY")),
+            audio_interface=DefaultAudioInterface(),
+            callback_agent_response=self._cb_agent_response,
+            callback_user_transcript=self._cb_user_transcript,
+            callback_latency_measurement=lambda ms: print(f"[ConvAI] {ms}ms"),
+            client_tools=ct,
+            config=init,
         )
 
         self._thread = threading.Thread(target=self._run, daemon=True)

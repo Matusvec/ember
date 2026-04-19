@@ -123,6 +123,16 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="L2 distance threshold for template match (default: %(default)s)",
     )
+    ap.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="Run CV + driver without opening any preview window (headless).",
+    )
+    ap.add_argument(
+        "--pip",
+        action="store_true",
+        help="Show a small picture-in-picture preview in the bottom-right corner.",
+    )
     return ap.parse_args()
 
 
@@ -152,8 +162,26 @@ def main() -> None:
 
     grabber = LatestFrameGrabber(cap)
 
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, DISPLAY_W, DISPLAY_H)
+    # Preview window modes:
+    #   --no-preview : headless, no window at all (cursor control still runs)
+    #   --pip        : small 320×240 picture-in-picture in the bottom-right
+    #   default      : normal resizable window
+    show_preview = not args.no_preview
+    if show_preview:
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+        if args.pip:
+            pw, ph = 320, 240
+            cv2.resizeWindow(WIN, pw, ph)
+            # Try to place it in the bottom-right corner. Screen size unknown
+            # without X deps, so we approximate with a large offset.
+            try:
+                cv2.moveWindow(WIN, 1600, 820)
+            except Exception:
+                pass
+        else:
+            cv2.resizeWindow(WIN, DISPLAY_W, DISPLAY_H)
+    else:
+        print("preview: headless mode — cursor still controlled by webcam", flush=True)
 
     pose = mp_pose.Pose(model_complexity=0, enable_segmentation=False)
     face = mp_face.FaceMesh(max_num_faces=1, refine_landmarks=False)
@@ -357,8 +385,13 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
-            cv2.imshow(WIN, frame)
-            key = cv2.waitKey(1) & 0xFF
+            if show_preview:
+                cv2.imshow(WIN, frame)
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                # Headless: still rate-limit to ~30 fps and allow key polls via Ctrl+C.
+                time.sleep(0.03)
+                key = 255
             if key == ord("q"):
                 break
             if key == ord("d") and mouse is not None:

@@ -106,6 +106,9 @@ class SetupDraft:
     # User-reported abilities (set by the agent during conversation).
     can_see: bool | None = None
     can_hear: bool | None = None
+    can_speak: bool | None = None
+    can_use_hands: bool | None = None
+    can_type: bool | None = None
     abilities_confirmed: bool = False
 
     def binding(self, bid: str) -> dict[str, Any] | None:
@@ -245,16 +248,21 @@ TOOL_SCHEMAS = [
         "type": "client",
         "name": "set_user_ability",
         "description": (
-            "Record an accessibility fact about the user. Call this after "
-            "they answer the setup questions about vision and hearing. "
-            "'ability' must be 'vision' or 'hearing'. 'value' is true if "
-            "they confirmed they can see/hear well, false if they said no."
+            "Record an accessibility fact about the user. Call this IMMEDIATELY "
+            "after each yes/no answer to an ability question. Abilities: "
+            "'vision' (can see the screen), 'hearing' (can hear you), "
+            "'speech' (can speak command words), 'hands' (can reliably move "
+            "hands/fingers), 'typing' (has a working hardware keyboard they "
+            "can use). value=true for yes, false for no."
         ),
         "parameters": {
             "type": "object",
             "required": ["ability", "value"],
             "properties": {
-                "ability": {"type": "string", "enum": ["vision", "hearing"]},
+                "ability": {
+                    "type": "string",
+                    "enum": ["vision", "hearing", "speech", "hands", "typing"],
+                },
                 "value":   {"type": "boolean"},
             },
         },
@@ -344,26 +352,40 @@ def _system_prompt(draft: SetupDraft) -> str:
         f"Based on discovery, they can use: {caps}. "
         f"The current proposed mapping is: {mapping}. "
         f"\n\nInteraction mode inferred: {mode}. {mode_notes} "
-        "\n\n#### ABSOLUTE HIGHEST PRIORITY (overrides every other rule): "
-        "If at ANY point — before, during, or after the opening sequence — the "
-        "user says any form of completion ('save it', 'save', 'done', 'I'm done', "
-        "'that's good', 'that's it', 'sounds good', 'looks good', 'okay', 'yep', "
-        "'finished', 'finish', 'we're good', 'perfect'), you MUST stop what "
-        "you're doing and call finish_setup IMMEDIATELY as your next action. "
-        "Do NOT continue the opening sequence. Do NOT ask any more questions. "
-        "Do NOT announce that you're saving. Just call the tool. The tool will "
-        "save and end the session. #### "
-        "\n\nOPENING SEQUENCE (if the user hasn't already confirmed or asked to save): "
-        "1) Ask: 'Can you see the screen clearly?' Wait for their answer. "
-        "   When they say yes or no, call set_user_ability with ability='vision' "
-        "   and value=true for yes, false for no. "
-        "2) Ask: 'Can you hear me well?' Wait for their answer. "
-        "   Call set_user_ability with ability='hearing' accordingly. "
-        "3) Only AFTER both answers are recorded, read back the current mapping "
-        "   and ask if they want to change anything. "
-        "\n\nIf they say they can't see well, explain: 'I'll narrate what's on "
-        "screen and open apps for you when you ask.' If they say they can't "
-        "hear well, offer to disable TTS. "
+        "\n\nABILITY QUESTIONS — this is the MAIN JOB of this conversation. "
+        "You MUST walk through these five yes/no questions IN ORDER and call "
+        "set_user_ability immediately after each answer. Do NOT batch them; "
+        "one question, one answer, one tool call. Do NOT skip any. These "
+        "answers determine whether Ember narrates the screen, shows captions, "
+        "pops an on-screen keyboard, or starts voice control — getting them "
+        "wrong hurts the user. "
+        "\n  1. 'Can you see the screen clearly?' -> set_user_ability(vision). "
+        "\n  2. 'Can you hear me well?' -> set_user_ability(hearing). "
+        "\n  3. 'Can you speak and say words I'd understand?' -> set_user_ability(speech). "
+        "\n  4. 'Can you move your hands or fingers to use a mouse?' -> set_user_ability(hands). "
+        "\n  5. 'Do you have a keyboard you can physically type on?' -> set_user_ability(typing). "
+        "\nAfter all five are recorded, read back the current mapping (one "
+        "sentence) and confirm. "
+        "\n\nTailor follow-ups: "
+        "  - vision=false: 'I'll describe what's on screen and open apps when "
+        "    you ask.' "
+        "  - hearing=false: 'I'll show captions on screen instead of speaking.' "
+        "  - speech=false: 'You'll use head or hand motion plus the on-screen "
+        "    keyboard to work. Voice commands will be off.' "
+        "  - hands=false AND typing=false: 'The on-screen keyboard will "
+        "    always be available — hover a key to type.' "
+        "\n\n#### COMPLETION RULE: "
+        "If the user says any form of completion ('save it', 'save', 'done', "
+        "'I'm done', 'that's good', 'that's it', 'sounds good', 'looks good', "
+        "'okay', 'yep', 'finished', 'finish', 'we're good', 'perfect') AND "
+        "all five abilities have been recorded, you MUST call finish_setup "
+        "immediately as your next action — no sign-off sentence first. "
+        "If the user asks to save BEFORE all five abilities are recorded, "
+        "ask the remaining ability questions one at a time first, then save. "
+        "NEVER say 'saved', 'all set', 'have a great day', or any similar "
+        "sign-off unless finish_setup has already been called in the SAME "
+        "turn — the watchdog will force-save if you do, which you do not "
+        "want because you might miss a question. #### "
         "\n\nTools: "
         "- set_user_ability(ability, value): record vision/hearing. USE EARLY. "
         "- set_cursor_source / set_click_source: change what drives cursor/click. "
@@ -439,14 +461,24 @@ class SetupAgent:
 
         # New SDK: tools register onto a ClientTools object; overrides go via
         # ConversationInitiationData(conversation_config_override=...).
-        # Handlers now take a single dict of params — wrap to keep our kwargs style.
+        # Handlers take a single dict of params — wrap to log every invocation
+        # AND strip ElevenLabs meta keys so **kwargs doesn't explode.
+        _META_KEYS = {"tool_call_id", "tool_id", "call_id"}
         ct = ClientTools()
-        def _wrap(fn: Callable) -> Callable[[dict], Any]:
+        def _wrap(tool_name: str, fn: Callable) -> Callable[[dict], Any]:
             def _inner(params: dict) -> Any:
-                return fn(**(params or {}))
+                p = {k: v for k, v in (params or {}).items() if k not in _META_KEYS}
+                print(f"[setup-tool] -> {tool_name}({p})", flush=True)
+                try:
+                    result = fn(**p)
+                    print(f"[setup-tool] <- {tool_name}: {result}", flush=True)
+                    return result
+                except Exception as exc:
+                    print(f"[setup-tool] !! {tool_name} FAILED: {exc}", flush=True)
+                    return f"error: {exc}"
             return _inner
         for name, handler in self._client_tools().items():
-            ct.register(name, _wrap(handler))
+            ct.register(name, _wrap(name, handler))
 
         init = ConversationInitiationData(
             conversation_config_override={
@@ -523,17 +555,24 @@ class SetupAgent:
 
     def _tool_set_ability(self, ability: str, value: bool) -> str:
         a = ability.lower().strip()
-        if a == "vision":
-            self.draft.can_see = bool(value)
-        elif a == "hearing":
-            self.draft.can_hear = bool(value)
-        else:
+        aliases = {
+            "vision": "can_see", "see": "can_see", "sight": "can_see",
+            "hearing": "can_hear", "hear": "can_hear",
+            "speech": "can_speak", "speak": "can_speak", "voice": "can_speak",
+            "hands": "can_use_hands", "hand": "can_use_hands", "motor": "can_use_hands",
+            "typing": "can_type", "type": "can_type", "keyboard": "can_type",
+        }
+        field_name = aliases.get(a)
+        if field_name is None:
             return f"unknown ability {ability}"
-        # Mark confirmed once both have been answered at least once.
-        if self.draft.can_see is not None and self.draft.can_hear is not None:
+        setattr(self.draft, field_name, bool(value))
+        # Confirmed once all five have a recorded answer.
+        if all(getattr(self.draft, f) is not None
+               for f in ("can_see", "can_hear", "can_speak",
+                         "can_use_hands", "can_type")):
             self.draft.abilities_confirmed = True
         self._on_update(self.draft)
-        return f"recorded: {a}={value}"
+        return f"recorded: {field_name}={value}"
 
     def _tool_list_caps(self) -> str:
         labels = self.draft.capability_labels()
@@ -659,9 +698,74 @@ class SetupAgent:
         "enjoy using ember", "welcome to ember",
     )
 
+    # Ability declarations the agent emits in readbacks ("I've updated that
+    # you cannot see", "to confirm, you can hear me well, ..."). We extract
+    # them so the profile is correct even when the LLM narrates the update
+    # instead of calling set_user_ability.
+    _ABILITY_PARSE_RULES = {
+        "can_see": (
+            ["you can see the screen", "you can see it",
+             "you can see clearly", "you see the screen"],
+            ["you cannot see", "you can't see", "can't see the screen",
+             "you are blind", "you're blind"],
+        ),
+        "can_hear": (
+            ["you can hear", "hear me well"],
+            ["you cannot hear", "you can't hear",
+             "you are deaf", "you're deaf"],
+        ),
+        "can_speak": (
+            ["you can speak", "speak words"],
+            ["you cannot speak", "you can't speak",
+             "you are mute", "you're mute"],
+        ),
+        "can_use_hands": (
+            ["move your hands", "use your hands", "use a mouse"],
+            ["cannot move your hands", "can't move your hands",
+             "cannot use your hands", "can't use your hands"],
+        ),
+        "can_type": (
+            ["have a keyboard", "can physically type",
+             "have a physical keyboard"],
+            ["cannot type", "can't type",
+             "no keyboard", "don't have a keyboard",
+             "do not have a keyboard"],
+        ),
+    }
+
+    def _parse_abilities_from_speech(self, text: str) -> None:
+        """Last-write-wins extraction of ability declarations from agent
+        readbacks. Negatives checked first because they're more specific."""
+        t = " " + text.lower() + " "
+        changed = False
+        for field, (pos_kw, neg_kw) in self._ABILITY_PARSE_RULES.items():
+            if any(kw in t for kw in neg_kw):
+                if getattr(self.draft, field) is not False:
+                    setattr(self.draft, field, False)
+                    print(f"[setup-agent] parsed from speech: {field}=False",
+                          flush=True)
+                    changed = True
+            elif any(kw in t for kw in pos_kw):
+                if getattr(self.draft, field) is not True:
+                    setattr(self.draft, field, True)
+                    print(f"[setup-agent] parsed from speech: {field}=True",
+                          flush=True)
+                    changed = True
+        if changed and all(
+            getattr(self.draft, f) is not None
+            for f in ("can_see", "can_hear", "can_speak",
+                      "can_use_hands", "can_type")
+        ):
+            self.draft.abilities_confirmed = True
+            self._on_update(self.draft)
+
     def _on_agent_response(self, text: str) -> None:
         self._last_agent_text = text
         print(f"[ember] {text}")
+        # Parse the agent's readback for ability declarations — belt-and-
+        # suspenders for LLMs that narrate "I've updated..." without calling
+        # the tool.
+        self._parse_abilities_from_speech(text)
         # Watchdog: the LLM often announces it will "save" or even speaks the
         # tool name instead of calling it. Detect those and force-save so the
         # user isn't stuck in limbo.

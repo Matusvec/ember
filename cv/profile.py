@@ -122,6 +122,7 @@ def default_abilities() -> dict[str, Any]:
         "can_see": None,
         "can_hear": None,
         "can_speak": None,
+        "can_use_hands": None,
         "can_type": None,
         "confirmed": False,
     }
@@ -133,9 +134,61 @@ def abilities_from_capabilities(caps: dict[str, bool]) -> dict[str, Any]:
         "can_see": True,  # default assumption -- agent asks to confirm
         "can_hear": True,
         "can_speak": bool(caps.get("voice")),
+        "can_use_hands": bool(caps.get("hand")),
         "can_type": bool(caps.get("keyboard")),
         "confirmed": False,
     }
+
+
+def apply_ability_preferences(prefs: dict[str, Any],
+                              abilities: dict[str, Any]) -> dict[str, Any]:
+    """Refine mode preferences using explicit self-reported abilities.
+
+    Runtime flags this sets:
+      tts_enabled         -- False when can_hear=False (deaf users get captions)
+      narration_enabled   -- True when can_see=False (aggressive description)
+      voice_control       -- False when can_speak=False (no ConvAI input)
+      auto_wake           -- True for blind / voice-primary users
+      show_captions       -- True when can_hear=False (visual agent output)
+      keyboard_always_on  -- True when user can't speak AND can't physically
+                             type -- they'll dwell-type with head cursor.
+    """
+    out = dict(prefs)
+    see   = abilities.get("can_see")
+    hear  = abilities.get("can_hear")
+    speak = abilities.get("can_speak")
+    hands = abilities.get("can_use_hands")
+    typ   = abilities.get("can_type")
+
+    if hear is False:
+        out["tts_enabled"] = False
+        out["narration_enabled"] = False
+        out["show_captions"] = True
+    else:
+        out.setdefault("show_captions", False)
+
+    if see is False:
+        out["narration_enabled"] = True
+        out["voice_control"] = True
+        out["auto_wake"] = True
+
+    if speak is False:
+        out["voice_control"] = False
+        out["auto_wake"] = False
+    elif speak is True:
+        out.setdefault("voice_control", True)
+
+    # Dwell-typing on the on-screen keyboard is their keyboard when they can
+    # neither speak nor use a hardware keyboard. Needs cursor control, so we
+    # check that there's at least a head/hand capability upstream; otherwise
+    # the keyboard is useless. (Caller ensures that — this helper only sets
+    # the pref.)
+    if speak is False and typ is False:
+        out["keyboard_always_on"] = True
+    else:
+        out.setdefault("keyboard_always_on", False)
+
+    return out
 
 
 def default_profile() -> dict[str, Any]:
@@ -261,6 +314,9 @@ def from_capabilities(caps: dict[str, bool]) -> dict[str, Any]:
     if caps.get("voice") and not can_type_by_hand:
         prefs["auto_wake"] = True
         prefs["voice_control"] = True
+    # Layer self-reported abilities on top of mode-based prefs so deaf/blind/
+    # mute flags actually change runtime behavior.
+    prefs = apply_ability_preferences(prefs, prof["user_abilities"])
     prof["preferences"] = prefs
     if prof["preferences"].get("voice_control"):
         prof["voice_enabled"] = True

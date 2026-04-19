@@ -1011,18 +1011,13 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
                     phase_start = now
                     continue
 
-                # ESC during conversation -> drop to dwell-based summary so user
-                # can still save without voice.
+                # ESC during conversation -> accept whatever the agent has
+                # collected and save. Users often say "save it" aloud then
+                # hit Esc to finalize; previously that dropped all abilities
+                # gathered during the conversation.
                 if key == 27:
+                    agent.draft.finished = True
                     agent.end()
-                    agent = None
-                    phase = "summary"
-                    phase_start = now
-                    confirm_start = 0.0
-                    redo_start = 0.0
-                    narrator = Narrator()
-                    narrator.start()
-                    narrator.say("Okay, using the buttons instead.")
                     continue
 
                 if agent.draft.redo_requested:
@@ -1045,22 +1040,21 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
                     # Merge in the agent-confirmed user abilities (fall back to
                     # capability-based guesses if the agent didn't ask).
                     abilities = result_profile.get("user_abilities", {})
-                    if agent.draft.can_see is not None:
-                        abilities["can_see"] = bool(agent.draft.can_see)
-                    if agent.draft.can_hear is not None:
-                        abilities["can_hear"] = bool(agent.draft.can_hear)
+                    ability_fields = (
+                        "can_see", "can_hear", "can_speak",
+                        "can_use_hands", "can_type",
+                    )
+                    for f in ability_fields:
+                        v = getattr(agent.draft, f, None)
+                        if v is not None:
+                            abilities[f] = bool(v)
                     abilities["confirmed"] = agent.draft.abilities_confirmed
                     result_profile["user_abilities"] = abilities
-                    # If the user said they can't see, force narration on; if
-                    # they said they can't hear, force TTS off.
-                    prefs = result_profile.get("preferences", {})
-                    if abilities.get("can_see") is False:
-                        prefs["narration_enabled"] = True
-                        prefs["voice_control"] = True
-                        prefs["auto_wake"] = True
-                    if abilities.get("can_hear") is False:
-                        prefs["tts_enabled"] = False
-                        prefs["narration_enabled"] = False
+                    # Derive runtime prefs from abilities (deaf -> captions,
+                    # blind -> narration, mute+no-keyboard -> on-screen kb).
+                    prefs = profile_mod.apply_ability_preferences(
+                        result_profile.get("preferences", {}), abilities,
+                    )
                     result_profile["preferences"] = prefs
                     profile_mod.save(result_profile)
                     print(f"onboarding: profile saved -> {profile_mod.PROFILE_PATH}", flush=True)

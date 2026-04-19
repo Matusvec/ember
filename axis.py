@@ -182,14 +182,50 @@ def main() -> None:
         except Exception as exc:
             print(f"onboarding: skipped ({exc})", flush=True)
 
+    # Ability-driven runtime flags. Derived from user_abilities during
+    # onboarding; applied here so every launch honors them.
+    prefs = (profile or {}).get("preferences", {})
+    abilities = (profile or {}).get("user_abilities", {})
+
+    # Deaf users: captions instead of TTS. Until the captions overlay ships,
+    # we skip the voice pipeline entirely so the agent isn't yelling into a
+    # void the user can't hear.
+    force_disable_voice = False
+    if prefs.get("tts_enabled") is False or abilities.get("can_hear") is False:
+        force_disable_voice = True
+        print("voice: disabled — user reports can_hear=False (captions TBD)", flush=True)
+    if prefs.get("voice_control") is False or abilities.get("can_speak") is False:
+        force_disable_voice = True
+        print("voice: disabled — user reports can_speak=False", flush=True)
+
+    # Mute + no hardware keyboard = dwell-type on the virtual keyboard. Spawn
+    # it on launch so it's always available. Requires some cursor source
+    # (head or hand) — otherwise the keyboard is useless, so we skip it.
+    if prefs.get("keyboard_always_on") and any(
+        (profile or {}).get("capabilities", {}).get(k)
+        for k in ("head", "hand")
+    ):
+        try:
+            import subprocess
+            kb_script = ROOT / "cv" / "virtual_keyboard.py"
+            if kb_script.exists():
+                subprocess.Popen(
+                    [sys.executable, str(kb_script)],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print("keyboard: on-screen keyboard launched (user has no speech + no keyboard)", flush=True)
+        except Exception as exc:
+            print(f"keyboard: auto-launch failed ({exc})", flush=True)
+
     # Voice pipeline is opt-in. Start before CV so the wake-word listener is hot.
-    want_voice = voice_wanted(args, profile)
+    want_voice = voice_wanted(args, profile) and not force_disable_voice
     voice_thread: threading.Thread | None = None
     if want_voice:
         # If the profile prefers voice-first (blind / motor-limited / keyboard-
         # less), auto-start + auto-restart the conversation so the user never
         # has to press a key to wake it.
-        prefs = (profile or {}).get("preferences", {})
         if prefs.get("auto_wake"):
             os.environ["EMBER_VOICE_AUTO_WAKE"] = "1"
             print("voice: auto-wake enabled (user needs hands-free voice access)", flush=True)

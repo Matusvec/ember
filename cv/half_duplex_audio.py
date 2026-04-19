@@ -32,7 +32,7 @@ def _env_float(name: str, default: float) -> float:
 
 class HalfDuplexAudioInterface(DefaultAudioInterface):
 
-    SPEAK_TAIL_S = _env_float("EMBER_SPEAK_TAIL_S", 0.5)
+    SPEAK_TAIL_S = _env_float("EMBER_SPEAK_TAIL_S", 1.0)
 
     def __init__(self) -> None:
         super().__init__()

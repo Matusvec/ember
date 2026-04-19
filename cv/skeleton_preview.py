@@ -12,6 +12,7 @@ Latency notes:
 """
 
 import argparse
+import math
 import sys
 import threading
 import time
@@ -20,6 +21,51 @@ import cv2
 import mediapipe as mp
 
 from cursor import VirtualMouse
+
+
+class OneEuroFilter:
+    """1-Euro filter — adaptive low-pass for pointer tracking.
+
+    Filters hard when the signal is still (kills jitter) and lets fast motion
+    through cleanly (stays responsive). Originally from Casiez, Roussel, Vogel 2012.
+
+    https://gery.casiez.net/1euro/
+    """
+
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.05, d_cutoff: float = 1.0) -> None:
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev: float | None = None
+        self.dx_prev: float = 0.0
+        self.t_prev: float | None = None
+
+    @staticmethod
+    def _alpha(cutoff: float, dt: float) -> float:
+        r = 2 * math.pi * cutoff * dt
+        return r / (r + 1)
+
+    def filter(self, x: float, t: float) -> float:
+        if self.t_prev is None or self.x_prev is None:
+            self.t_prev = t
+            self.x_prev = x
+            return x
+        dt = max(t - self.t_prev, 1e-6)
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self._alpha(cutoff, dt)
+        x_hat = a * x + (1 - a) * self.x_prev
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t
+        return x_hat
+
+    def reset(self) -> None:
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
 
 
 def pick_capture_backend(os_name: str) -> int:
@@ -40,15 +86,26 @@ CAP_W, CAP_H = 640, 480
 DISPLAY_W, DISPLAY_H = 1280, 720
 
 CURSOR_SENSITIVITY = 2500
-CURSOR_SMOOTHING = 0.4
 INDEX_TIP = 8
+
+# One-Euro filter tuning.  Lower min_cutoff = smoother when still (more latency).
+# Higher beta = more responsive when moving fast.
+FILTER_MIN_CUTOFF = 1.0
+FILTER_BETA = 0.05
+
+# If the hand disappears for longer than this, wipe filter state so the cursor
+# does not "snap" when the hand reappears in a new location.
+DROPOUT_RESET_S = 0.3
+
+# Pixel-level dead zone.  Tiny sub-pixel deltas are dropped, killing residual
+# jitter without accumulating error (fractional remainder is carried forward).
+CURSOR_DEAD_ZONE_PX = 1
 
 UPPER_LIP = 13
 LOWER_LIP = 14
 FOREHEAD = 10
 CHIN = 152
 MOUTH_OPEN_THRESHOLD = 0.08
-CLICK_COOLDOWN_S = 0.5
 
 
 class LatestFrameGrabber:
@@ -146,12 +203,13 @@ def main() -> None:
     else:
         print(f"cursor control disabled on {os_name} — preview only", flush=True)
 
-    prev_finger = None
-    smoothed_dx = 0.0
-    smoothed_dy = 0.0
+    filter_x = OneEuroFilter(min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
+    filter_y = OneEuroFilter(min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
+    prev_smooth = None
+    remainder_x = 0.0
+    remainder_y = 0.0
+    last_detect_t = 0.0
     mouth_was_open = False
-    last_click_t = 0.0
-    click_flash_until = 0.0
     last = time.monotonic()
     fps_ema = 0.0
 
@@ -217,19 +275,31 @@ def main() -> None:
                 h, w = frame.shape[:2]
                 cv2.circle(frame, (int(tip.x * w), int(tip.y * h)), 12, (0, 255, 255), 2)
 
-            if mouse is not None and cursor_on and index_tip is not None:
-                if prev_finger is not None:
-                    raw_dx = (index_tip[0] - prev_finger[0]) * CURSOR_SENSITIVITY
-                    raw_dy = (index_tip[1] - prev_finger[1]) * CURSOR_SENSITIVITY
-                    smoothed_dx = CURSOR_SMOOTHING * raw_dx + (1 - CURSOR_SMOOTHING) * smoothed_dx
-                    smoothed_dy = CURSOR_SMOOTHING * raw_dy + (1 - CURSOR_SMOOTHING) * smoothed_dy
-                    mouse.move(int(smoothed_dx), int(smoothed_dy))
-                prev_finger = index_tip
-            else:
-                prev_finger = None
-                smoothed_dx = smoothed_dy = 0.0
-
             now = time.monotonic()
+
+            if mouse is not None and cursor_on and index_tip is not None:
+                if now - last_detect_t > DROPOUT_RESET_S:
+                    filter_x.reset()
+                    filter_y.reset()
+                    prev_smooth = None
+                    remainder_x = remainder_y = 0.0
+
+                sx = filter_x.filter(index_tip[0], now)
+                sy = filter_y.filter(index_tip[1], now)
+                smooth = (sx, sy)
+
+                if prev_smooth is not None:
+                    move_x = (smooth[0] - prev_smooth[0]) * CURSOR_SENSITIVITY + remainder_x
+                    move_y = (smooth[1] - prev_smooth[1]) * CURSOR_SENSITIVITY + remainder_y
+                    int_x = int(move_x)
+                    int_y = int(move_y)
+                    remainder_x = move_x - int_x
+                    remainder_y = move_y - int_y
+                    if abs(int_x) >= CURSOR_DEAD_ZONE_PX or abs(int_y) >= CURSOR_DEAD_ZONE_PX:
+                        mouse.move(int_x, int_y)
+
+                prev_smooth = smooth
+                last_detect_t = now
             if mouse is not None and cursor_on:
                 if mouth_is_open and not mouth_was_open:
                     mouse.press("left")
@@ -268,7 +338,10 @@ def main() -> None:
                 break
             if key == ord("c") and mouse is not None:
                 cursor_on = not cursor_on
-                prev_finger = None
+                filter_x.reset()
+                filter_y.reset()
+                prev_smooth = None
+                remainder_x = remainder_y = 0.0
     finally:
         grabber.stop()
         cap.release()

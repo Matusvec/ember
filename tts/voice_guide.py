@@ -142,10 +142,29 @@ def announce_mapping(gesture: str, action: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Confirmation and error phrases (used by voice pipeline tool handler)
+# ---------------------------------------------------------------------------
+
+CONFIRMATION_PHRASES: dict[str, str] = {
+    "confirm_close":    "About to close the current window. Say yes to confirm.",
+    "confirm_delete":   "About to delete this. Say yes to confirm.",
+    "confirm_submit":   "About to submit this form. Say yes to confirm.",
+    "cancelled":        "Cancelled.",
+    "not_understood":   "I didn't catch that. Try again?",
+    "tool_unavailable": "I can't do that one yet.",
+    "undo_success":     "Done. Last action undone.",
+    "undo_empty":       "Nothing left to undo.",
+    "narration_start":  "Screen narration enabled.",
+    "narration_stop":   "Screen narration stopped.",
+}
+
+
+# ---------------------------------------------------------------------------
 # Master phrase list — feed to service.prewarm() at startup
 # ---------------------------------------------------------------------------
 
 PHRASES: list[str] = (
     list(CALIBRATION_SCRIPTS.values())
     + list(STATUS_SCRIPTS.values())
+    + list(CONFIRMATION_PHRASES.values())
 )

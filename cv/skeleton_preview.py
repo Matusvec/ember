@@ -15,6 +15,7 @@ Latency notes:
 """
 
 import argparse
+import re
 import sys
 import threading
 import time
@@ -25,6 +26,7 @@ import mediapipe as mp
 
 from cursor import VirtualMouse
 from mapping import MappingConfig, MappingDispatcher
+from recorder import GestureRecorder
 from sources import (
     eye_aspect_ratio,
     eyebrow_raise,
@@ -32,6 +34,7 @@ from sources import (
     mouth_ratio,
     nose_tip,
 )
+from templates import TemplateMatcher
 
 
 def pick_capture_backend(os_name: str) -> int:
@@ -53,7 +56,9 @@ CAP_W, CAP_H = 640, 480
 DISPLAY_W, DISPLAY_H = 1280, 720
 
 # Relative to the repo root.  Preview is run from repo root, so this resolves.
-DEFAULT_MAPPING_PATH = Path(__file__).resolve().parent.parent / "mapping.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MAPPING_PATH = REPO_ROOT / "mapping.json"
+DEFAULT_GESTURES_DIR = REPO_ROOT / "gestures"
 
 
 class LatestFrameGrabber:
@@ -107,6 +112,17 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_MAPPING_PATH),
         help="Path to mapping.json (default: %(default)s)",
     )
+    ap.add_argument(
+        "--gestures",
+        default=str(DEFAULT_GESTURES_DIR),
+        help="Directory holding recorded gesture templates (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--gesture-threshold",
+        type=float,
+        default=0.25,
+        help="L2 distance threshold for template match (default: %(default)s)",
+    )
     return ap.parse_args()
 
 
@@ -158,6 +174,14 @@ def main() -> None:
 
     config = MappingConfig(args.mapping)
     dispatcher = MappingDispatcher(config, mouse)
+
+    gestures_dir = Path(args.gestures)
+    recorder = GestureRecorder(out_dir=gestures_dir)
+    matcher = TemplateMatcher(
+        gestures_dir=gestures_dir,
+        threshold=args.gesture_threshold,
+    )
+    print(f"gestures dir: {gestures_dir} — press [r] to record a new one", flush=True)
 
     last = time.monotonic()
     fps_ema = 0.0
@@ -212,6 +236,16 @@ def main() -> None:
                         mp_styles.get_default_hand_connections_style(),
                     )
 
+            now = time.monotonic()
+
+            # Let the recorder consume landmarks (no-op unless recording is active).
+            recorder.feed(face_res.multi_face_landmarks, now)
+            if recorder.just_finished:
+                path = recorder.commit()
+                if path:
+                    print(f"saved gesture: {path}", flush=True)
+                    matcher.load()
+
             # Extract source values for the dispatcher.
             sources_dict = {
                 "nose": nose_tip(face_res.multi_face_landmarks),
@@ -221,7 +255,10 @@ def main() -> None:
                 "brow": eyebrow_raise(face_res.multi_face_landmarks),
             }
 
-            now = time.monotonic()
+            matcher.maybe_reload()
+            template_signals = matcher.active_sources(face_res.multi_face_landmarks)
+            sources_dict.update(template_signals)
+
             config.maybe_reload()
             events = dispatcher.dispatch(sources_dict, now) if dispatcher_enabled else []
 
@@ -268,6 +305,39 @@ def main() -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA,
                 )
 
+            # Active template matches.
+            matched_names = [
+                k.replace("gesture:", "") for k, v in template_signals.items() if v > 0.5
+            ]
+            if matched_names:
+                cv2.putText(
+                    frame, f"GESTURE: {', '.join(matched_names)}", (12, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 255, 180), 2, cv2.LINE_AA,
+                )
+
+            # Recording overlay.
+            rec_phase = recorder.phase(now)
+            if rec_phase == "countdown":
+                remaining = recorder.countdown_remaining(now)
+                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (60, 60, 255), 10)
+                cv2.putText(
+                    frame,
+                    f"RECORDING '{recorder.name}' in {remaining:.1f}s",
+                    (12, h - 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 255), 2, cv2.LINE_AA,
+                )
+            elif rec_phase == "recording":
+                progress = recorder.record_progress(now)
+                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 10)
+                bar_w = int((w - 24) * progress)
+                cv2.rectangle(frame, (12, h - 40), (12 + bar_w, h - 24), (0, 0, 255), -1)
+                cv2.putText(
+                    frame,
+                    f"HOLD: {recorder.name}  {int(progress * 100)}%",
+                    (12, h - 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA,
+                )
+
             inst_fps = 1.0 / max(now - last, 1e-6)
             last = now
             fps_ema = inst_fps if fps_ema == 0.0 else 0.9 * fps_ema + 0.1 * inst_fps
@@ -277,7 +347,8 @@ def main() -> None:
             cv2.putText(
                 frame,
                 f"{fps_ema:5.1f} fps   dispatcher {disp_state}   "
-                f"{enabled_count} bindings   {ear_text}   {brow_text}   [d] toggle  [q] quit",
+                f"{enabled_count} bindings   {len(matcher.templates)} gestures   "
+                f"{ear_text}   {brow_text}   [r] record  [d] toggle  [q] quit",
                 (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -299,6 +370,16 @@ def main() -> None:
                             mouse.release(btn)
                         except Exception:
                             pass
+            if key == ord("r") and not recorder.active:
+                # Terminal prompt — window briefly unresponsive; grabber thread keeps camera alive.
+                print("\n── record new gesture ──", flush=True)
+                raw = input("name (letters/numbers, empty to cancel): ").strip()
+                safe = re.sub(r"[^a-zA-Z0-9_]+", "_", raw).strip("_")
+                if safe:
+                    recorder.start(safe, countdown_s=3.0, hold_s=1.0)
+                    print(f"recording '{safe}' in 3s — hold the pose when counter hits 0.", flush=True)
+                else:
+                    print("cancelled.", flush=True)
     finally:
         grabber.stop()
         cap.release()

@@ -34,7 +34,7 @@ class MappingConfig:
     def __init__(self, path: str | Path = "mapping.json") -> None:
         self.path = Path(path)
         self._mtime: float = 0.0
-        self.cursor_sensitivity: float = 4000
+        self.cursor_sensitivity: float = 4000 #Aleks made this
         self.filter_min_cutoff: float = 1.0
         self.filter_beta: float = 0.05
         self.bindings: list[Binding] = []

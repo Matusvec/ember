@@ -273,11 +273,16 @@ class TestState:
         self.brow_baseline: float | None = None
         self.brow_samples: list[float] = []
         # Blink: adaptive baseline so we detect a RELATIVE drop in EAR
-        # instead of an absolute threshold (which varies per person).
+        # instead of an absolute threshold (which varies per person). The
+        # onboarding test only counts DELIBERATE blinks (deep closure held
+        # for a beat) so a user who naturally blinks during the test isn't
+        # falsely marked blink-capable.
         self.ear_baseline: float | None = None
         self.ear_samples: list[float] = []
         self.blinks_seen = 0
         self.last_ear_above = True
+        self.closure_started_at: float | None = None
+        self.current_blink_scored = False
         self.hand_frames = 0
         self.total_frames = 0
         self.keyboard_pressed = False
@@ -319,19 +324,15 @@ def _update_test(test_id: str, st: TestState, face_lms, hand_lms, key_pressed: i
     if test_id == "blink":
         ear = eye_aspect_ratio(face_lms, "both")
         if ear is not None:
-            # Collect samples and build a baseline from the first ~1.2s of
-            # (presumably) open-eye data, then require the EAR to drop to
-            # 65% of baseline (= clear closure) to count as a blink. This
-            # adapts to each user's natural eye shape instead of demanding
-            # an absolute threshold that some people never cross.
+            # Baseline = median of first ~1.2s open-eye samples.
             st.ear_samples.append(ear)
             if len(st.ear_samples) > 120:
                 st.ear_samples = st.ear_samples[-120:]
             if st.ear_baseline is None and (now - st.t_start) > 1.2 and len(st.ear_samples) > 10:
-                # Take the median of the open samples (robust to accidental blinks)
                 sorted_s = sorted(st.ear_samples)
                 st.ear_baseline = sorted_s[len(sorted_s) // 2]
-            # For display: 0..1 "closure" meter = how close to fully closed
+            # Single blink passes: EAR drops below 70% of baseline on the
+            # falling edge. Lenient on purpose — a natural blink works.
             drop_thresh = (st.ear_baseline * 0.70) if st.ear_baseline else BLINK_EAR_THRESH
             closure = max(0.0, min(1.0,
                 ((st.ear_baseline or 0.28) - ear) /
@@ -410,7 +411,7 @@ TESTS: list[dict[str, Any]] = [
     {
         "id": "blink",
         "title": "Try blinking both eyes",
-        "hint": "A firm, deliberate blink -- close for a beat, then open",
+        "hint": "A normal blink -- close both eyes, then open.",
         "meter_label": "eye closure",
         "meter_max": 0.25,
     },
@@ -447,7 +448,7 @@ TESTS: list[dict[str, Any]] = [
 TEST_SPOKEN: dict[str, str] = {
     "head": "Try moving your head. Tilt it side to side, or just shift a little.",
     "mouth": "Try opening your mouth. Open wide, like saying ah.",
-    "blink": "Try blinking both eyes. A firm, deliberate blink.",
+    "blink": "Try blinking both eyes.",
     "brow": "Try raising your eyebrows.",
     "hand": "Try holding up your hand into the camera view.",
     "voice": "Try speaking any words.",

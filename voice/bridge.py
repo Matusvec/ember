@@ -66,15 +66,39 @@ class VoiceBridge:
         Start the voice pipeline. Designed to be the sole coroutine on a
         dedicated asyncio event loop (see module docstring).
         Never call this on the same loop as the CV pipeline.
+
+        If EMBER_VOICE_AUTO_WAKE=1 (set by axis.py when the user's profile
+        prefers voice-first control), the session is opened on startup and
+        auto-restarted whenever it ends -- so the user never has to trigger
+        a wake word or press a key. They can just talk.
         """
         self._loop = asyncio.get_running_loop()
-        self._wake.start()
-        print("[Voice] Ready — waiting for wake word.")
+        auto_wake = os.getenv("EMBER_VOICE_AUTO_WAKE", "0") == "1"
 
         tasks: list[asyncio.Task] = []
         if _CONTINUOUS_NARRATION:
             tasks.append(asyncio.create_task(self._narrator.start_continuous()))
             print("[Voice] Continuous screen narration enabled.")
+
+        if auto_wake:
+            print("[Voice] Auto-wake: starting session immediately.")
+            self._on_wake()
+            # also keep the wake detector running so the user can re-trigger
+            # if the session ever drops.
+        self._wake.start()
+        if not auto_wake:
+            print("[Voice] Ready -- waiting for wake word.")
+
+        # Auto-restart watchdog: when the session ends, re-open it so voice-
+        # first users stay in an always-live conversation.
+        async def _watchdog() -> None:
+            while True:
+                await asyncio.sleep(1.5)
+                if auto_wake and self._session is None:
+                    self._on_wake()
+
+        if auto_wake:
+            tasks.append(asyncio.create_task(_watchdog()))
 
         try:
             while True:

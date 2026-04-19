@@ -19,9 +19,14 @@ pip install pyautogui
 
 import asyncio
 import os
+import shutil
+import signal
 import subprocess
+import sys
+import urllib.parse
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Deque, Optional
 
 # pyautogui may fail to import on Wayland (tries to connect to X11 at module load).
@@ -100,11 +105,43 @@ TOOL_SCHEMAS = [
     {
         "type": "client",
         "name": "launch_app",
-        "description": "Open a well-known application by name (Chrome, Firefox, Slack, etc).",
+        "description": "Open an application by name (Chrome, Firefox, Slack, etc). Falls back to xdg-open for anything not in the known list.",
         "parameters": {
             "type": "object",
             "required": ["name"],
             "properties": {"name": {"type": "string"}},
+        },
+    },
+    {
+        "type": "client",
+        "name": "search_web",
+        "description": "Open the default browser to a search results page for a query. Use this for 'search for X', 'look up X', 'google X'.",
+        "parameters": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string"},
+                "engine": {
+                    "type": "string",
+                    "enum": ["google", "duckduckgo", "youtube"],
+                    "default": "google",
+                },
+            },
+        },
+    },
+    {
+        "type": "client",
+        "name": "keyboard",
+        "description": "Show, hide, or toggle the on-screen virtual keyboard. The keyboard lets the user type with their cursor by dwelling on keys.",
+        "parameters": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["show", "hide", "toggle"],
+                }
+            },
         },
     },
     {
@@ -144,21 +181,48 @@ class UndoRecord:
     reverse_fn: Optional[Callable] = None   # None = action is not undoable
 
 
-# ─── Known application name → executable map ────────────────────────────────
+# ─── Known application name → candidate executables ─────────────────────────
+#
+# Order matters: first executable that resolves via shutil.which() wins.
+# Anything not in this table falls through to xdg-open so the user's default
+# handler picks it up (useful for file managers, browsers set as default, etc).
 
 _APP_COMMANDS: dict[str, list[str]] = {
-    "chrome":        ["google-chrome"],
-    "google chrome": ["google-chrome"],
-    "firefox":       ["firefox"],
-    "terminal":      ["gnome-terminal", "xterm", "alacritty"],
+    "chrome":        ["google-chrome", "google-chrome-stable", "chromium", "brave-browser"],
+    "google chrome": ["google-chrome", "google-chrome-stable", "chromium", "brave-browser"],
+    "chromium":      ["chromium"],
+    "brave":         ["brave-browser", "brave"],
+    "firefox":       ["firefox", "firefox-esr"],
+    "browser":       ["xdg-open", "firefox", "google-chrome", "chromium"],
+    "terminal":      ["alacritty", "kitty", "gnome-terminal", "konsole", "xterm"],
     "slack":         ["slack"],
     "discord":       ["discord"],
-    "code":          ["code"],
-    "vscode":        ["code"],
+    "code":          ["code", "code-oss", "codium"],
+    "vscode":        ["code", "code-oss", "codium"],
     "spotify":       ["spotify"],
     "zoom":          ["zoom"],
-    "files":         ["nautilus", "nemo", "thunar"],
+    "files":         ["nautilus", "nemo", "thunar", "dolphin", "pcmanfm"],
+    "file manager":  ["nautilus", "nemo", "thunar", "dolphin", "pcmanfm"],
+    "calculator":    ["gnome-calculator", "kcalc", "qalculate-gtk"],
+    "settings":      ["gnome-control-center", "systemsettings"],
+    "email":         ["thunderbird"],
+    "thunderbird":   ["thunderbird"],
+    "notes":         ["gnome-text-editor", "gedit", "kate"],
 }
+
+
+# ─── Search engine URL templates ─────────────────────────────────────────────
+
+_SEARCH_URLS: dict[str, str] = {
+    "google":     "https://www.google.com/search?q={q}",
+    "duckduckgo": "https://duckduckgo.com/?q={q}",
+    "youtube":    "https://www.youtube.com/results?search_query={q}",
+}
+
+
+# ─── Virtual keyboard subprocess path ────────────────────────────────────────
+
+_KEYBOARD_SCRIPT = Path(__file__).resolve().parent.parent / "cv" / "virtual_keyboard.py"
 
 
 # ─── Dispatcher ─────────────────────────────────────────────────────────────
@@ -184,6 +248,7 @@ class ActionDispatcher:
         self._vi = virtual_input         # matus VirtualMouse, or None for pyautogui
         self._narrate = narrate_fn       # async fn() → str, set by VoiceBridge
         self._history: Deque[UndoRecord] = deque(maxlen=20)
+        self._keyboard_proc: Optional[subprocess.Popen] = None
         if _HAS_PYAUTOGUI:
             self._screen_w, self._screen_h = pyautogui.size()
         else:
@@ -205,6 +270,8 @@ class ActionDispatcher:
             "scroll":         self._tool_scroll,
             "type_text":      self._tool_type_text,
             "launch_app":     self._tool_launch_app,
+            "search_web":     self._tool_search_web,
+            "keyboard":       self._tool_keyboard,
             "narrate_screen": self._tool_narrate_screen,
             "undo":           self._tool_undo,
             "answer":         self._tool_answer,
@@ -270,21 +337,117 @@ class ActionDispatcher:
 
     def _tool_launch_app(self, name: str) -> str:
         key = name.lower().strip()
-        candidates = _APP_COMMANDS.get(key)
-        if not candidates:
-            return f"I don't know how to open {name}. Try the full application name."
+        candidates = _APP_COMMANDS.get(key, [])
+        # xdg-open fallback handles anything the user has registered a default
+        # handler for (including arbitrary URIs, .desktop names, etc).
+        if shutil.which("xdg-open"):
+            candidates = list(candidates) + [f"xdg-open:{key}"]
+
+        last_err: Optional[str] = None
         for cmd in candidates:
+            if cmd.startswith("xdg-open:"):
+                target = cmd.split(":", 1)[1]
+                # xdg-open only accepts URIs or existing files — if the user
+                # said "firefox" it won't resolve. Only try this when nothing
+                # else worked AND the target looks like a URL.
+                if not (target.startswith("http") or target.startswith("file:")):
+                    continue
+                exe = "xdg-open"
+                args = [exe, target]
+            else:
+                exe = cmd
+                args = [exe]
+            if not shutil.which(exe):
+                last_err = f"{exe} not on PATH"
+                continue
             try:
-                subprocess.Popen([cmd], start_new_session=True)
+                subprocess.Popen(
+                    args,
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 self._history.append(UndoRecord(
                     tool="launch_app",
                     description=f"Launched {name}",
-                    reverse_fn=None,   # closing apps is destructive, skip undo
+                    reverse_fn=None,
                 ))
                 return f"Opening {name}."
-            except FileNotFoundError:
+            except Exception as exc:
+                last_err = str(exc)
                 continue
-        return f"{name} doesn't appear to be installed."
+        detail = f" ({last_err})" if last_err else ""
+        return f"{name} doesn't appear to be installed{detail}."
+
+    def _tool_search_web(self, query: str, engine: str = "google") -> str:
+        template = _SEARCH_URLS.get(engine.lower(), _SEARCH_URLS["google"])
+        url = template.format(q=urllib.parse.quote_plus(query))
+        # Prefer xdg-open so the user's chosen browser handles it.
+        opener: list[str] = []
+        if shutil.which("xdg-open"):
+            opener = ["xdg-open", url]
+        else:
+            for br in ("firefox", "google-chrome", "chromium"):
+                if shutil.which(br):
+                    opener = [br, url]
+                    break
+        if not opener:
+            return "No browser available to search with."
+        try:
+            subprocess.Popen(
+                opener,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            return f"Search failed: {exc}"
+        self._history.append(UndoRecord(
+            tool="search_web",
+            description=f"Searched {engine} for '{query}'",
+            reverse_fn=None,
+        ))
+        return f"Searching {engine} for {query}."
+
+    def _tool_keyboard(self, action: str) -> str:
+        action = action.lower().strip()
+        if action == "toggle":
+            action = "hide" if self._keyboard_is_running() else "show"
+
+        if action == "show":
+            if self._keyboard_is_running():
+                return "Keyboard already showing."
+            if not _KEYBOARD_SCRIPT.exists():
+                return f"Keyboard script missing at {_KEYBOARD_SCRIPT}."
+            try:
+                self._keyboard_proc = subprocess.Popen(
+                    [sys.executable, str(_KEYBOARD_SCRIPT)],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                return f"Could not launch keyboard: {exc}"
+            return "Keyboard is up. Hover a key and dwell to type."
+
+        if action == "hide":
+            if not self._keyboard_is_running():
+                return "Keyboard is not showing."
+            try:
+                self._keyboard_proc.send_signal(signal.SIGTERM)
+                self._keyboard_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._keyboard_proc.kill()
+                except Exception:
+                    pass
+            self._keyboard_proc = None
+            return "Keyboard hidden."
+
+        return f"Unknown keyboard action: {action}."
+
+    def _keyboard_is_running(self) -> bool:
+        return self._keyboard_proc is not None and self._keyboard_proc.poll() is None
 
     def _tool_narrate_screen(self) -> str:
         if self._narrate:

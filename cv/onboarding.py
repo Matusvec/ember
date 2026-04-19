@@ -1,23 +1,23 @@
-"""Ember onboarding — guided capability wizard.
+"""Ember onboarding -- guided capability wizard.
 
 Walks a new user through discovering what they can do, then proposes a control
 scheme and saves it to ~/.ember/profile.json. Runs in a native OpenCV window so
 there is zero browser / permission friction.
 
 Flow:
-  1. welcome          — "I'll find how you can control your computer."
-  2. test_head        — "Try moving your head"
-  3. test_mouth       — "Try opening your mouth"
-  4. test_blink       — "Try blinking both eyes"
-  5. test_brow        — "Try raising your eyebrows"
-  6. test_hand        — "Try holding up your hand"
-  7. test_voice       — "Try speaking any words"
-  8. test_keyboard    — "Try pressing any key"
-  9. summary          — shows detected capabilities + proposed mapping
- 10. done             — saves profile and exits; axis.py takes over
+  1. welcome          -- "I'll find how you can control your computer."
+  2. test_head        -- "Try moving your head"
+  3. test_mouth       -- "Try opening your mouth"
+  4. test_blink       -- "Try blinking both eyes"
+  5. test_brow        -- "Try raising your eyebrows"
+  6. test_hand        -- "Try holding up your hand"
+  7. test_voice       -- "Try speaking any words"
+  8. test_keyboard    -- "Try pressing any key"
+  9. summary          -- shows detected capabilities + proposed mapping
+ 10. done             -- saves profile and exits; axis.py takes over
 
 Every test auto-advances once a signal is seen OR after a timeout, and can
-be skipped with Space. Esc aborts. No single input modality is required —
+be skipped with Space. Esc aborts. No single input modality is required --
 whatever the user can demonstrate is what they get.
 
 Optional ElevenLabs narration plays at each step when ELEVENLABS_API_KEY is
@@ -47,15 +47,15 @@ from sources import (
     nose_tip,
 )
 
-WIN = "Ember — setup"
+WIN = "Ember -- setup"
 CAP_W, CAP_H = 640, 480
 DISPLAY_W, DISPLAY_H = 1280, 720
 
 # Per-test budget; tests auto-complete early on a clear signal.
-TEST_DURATION_S = 8.0
-WELCOME_S = 6.0
-LINGER_AFTER_DETECT_S = 2.2
-DONE_FLASH_S = 3.5
+TEST_DURATION_S = 14.0
+WELCOME_S = 9.0
+LINGER_AFTER_DETECT_S = 3.0
+DONE_FLASH_S = 4.5
 
 # Signal thresholds for "capable" detection.
 HEAD_VARIANCE_THRESH = 0.005     # normalized nose-position variance
@@ -63,7 +63,7 @@ MOUTH_OPEN_THRESH = 0.09         # mouth_ratio peak
 BLINK_EAR_THRESH = 0.17          # EAR below this = eyes closed
 BROW_RAISE_DELTA = 0.012         # brow ratio spike vs baseline
 HAND_FRAME_RATIO = 0.25          # hand detected in >= 25% of frames
-VOICE_RMS_THRESH = 0.02          # mic RMS peak (typical speech ~0.05-0.3)
+VOICE_RMS_THRESH = 0.008         # mic RMS peak -- normal speech sits ~0.03-0.3
 
 
 # ---- Design tokens ---------------------------------------------------------
@@ -168,7 +168,7 @@ def _progress_pill(frame, cx: int, cy: int, w: int, h: int, progress: float,
 
 def _draw_progress_bar(frame, cx: int, cy: int, w: int, h: int, progress: float,
                        filled_color=ACCENT_EMBER) -> None:
-    """Legacy name — kept so older callers still work; delegates to pill style."""
+    """Legacy name -- kept so older callers still work; delegates to pill style."""
     _progress_pill(frame, cx, cy, w, h, progress, filled_color)
 
 
@@ -239,7 +239,7 @@ def _draw_chip(frame, text: str, cx: int, cy: int,
 def _draw_footer(frame, lines: list[str]) -> None:
     """Subtle bottom hint line."""
     y = DISPLAY_H - 28
-    text = "   ·   ".join(lines)
+    text = "   |   ".join(lines)
     tw, _ = _text_size(text, 0.5, 1)
     _put(frame, text, ((DISPLAY_W - tw) // 2, y), 0.5, TEXT_MUTED, 1)
 
@@ -258,10 +258,10 @@ def _draw_wordmark(frame, x: int, y: int) -> None:
 #   hint:        subtitle
 #   meter_label: what the live meter shows (None = no meter)
 #   meter_max:   scale for the meter
-#   detect:      function(state) → (current_value, is_capable_now)
+#   detect:      function(state) -> (current_value, is_capable_now)
 
 class TestState:
-    """Per-test rolling state — signal buffers and detection flags."""
+    """Per-test rolling state -- signal buffers and detection flags."""
     def __init__(self, test_id: str, started_at: float) -> None:
         self.id = test_id
         self.t_start = started_at
@@ -272,6 +272,10 @@ class TestState:
         self.nose_ys: list[float] = []
         self.brow_baseline: float | None = None
         self.brow_samples: list[float] = []
+        # Blink: adaptive baseline so we detect a RELATIVE drop in EAR
+        # instead of an absolute threshold (which varies per person).
+        self.ear_baseline: float | None = None
+        self.ear_samples: list[float] = []
         self.blinks_seen = 0
         self.last_ear_above = True
         self.hand_frames = 0
@@ -315,14 +319,32 @@ def _update_test(test_id: str, st: TestState, face_lms, hand_lms, key_pressed: i
     if test_id == "blink":
         ear = eye_aspect_ratio(face_lms, "both")
         if ear is not None:
-            st.peak_value = max(st.peak_value, 0.3 - ear)  # how much eyes closed
-            is_closed = ear < BLINK_EAR_THRESH
+            # Collect samples and build a baseline from the first ~1.2s of
+            # (presumably) open-eye data, then require the EAR to drop to
+            # 65% of baseline (= clear closure) to count as a blink. This
+            # adapts to each user's natural eye shape instead of demanding
+            # an absolute threshold that some people never cross.
+            st.ear_samples.append(ear)
+            if len(st.ear_samples) > 120:
+                st.ear_samples = st.ear_samples[-120:]
+            if st.ear_baseline is None and (now - st.t_start) > 1.2 and len(st.ear_samples) > 10:
+                # Take the median of the open samples (robust to accidental blinks)
+                sorted_s = sorted(st.ear_samples)
+                st.ear_baseline = sorted_s[len(sorted_s) // 2]
+            # For display: 0..1 "closure" meter = how close to fully closed
+            drop_thresh = (st.ear_baseline * 0.70) if st.ear_baseline else BLINK_EAR_THRESH
+            closure = max(0.0, min(1.0,
+                ((st.ear_baseline or 0.28) - ear) /
+                ((st.ear_baseline or 0.28) * 0.6 + 1e-6)
+            ))
+            st.peak_value = max(st.peak_value, closure)
+            is_closed = ear < drop_thresh
             if is_closed and st.last_ear_above:
                 st.blinks_seen += 1
             st.last_ear_above = not is_closed
             if st.blinks_seen >= 1:
                 st.detected = True
-            return (0.3 - ear), st.detected
+            return closure, st.detected
         return 0.0, st.detected
 
     if test_id == "brow":
@@ -360,7 +382,7 @@ def _update_test(test_id: str, st: TestState, face_lms, hand_lms, key_pressed: i
         return peak, st.detected
 
     if test_id == "keyboard":
-        # Any key other than ESC/Space/255 counts — but during tests we also
+        # Any key other than ESC/Space/255 counts -- but during tests we also
         # accept Space as "skip", so we check for any printable/arrow key.
         if key_pressed not in (255, -1, 27, 32):
             st.keyboard_pressed = True
@@ -374,21 +396,21 @@ TESTS: list[dict[str, Any]] = [
     {
         "id": "head",
         "title": "Try moving your head",
-        "hint": "Tilt, nod, or just shift side to side — anything that moves",
+        "hint": "Tilt, nod, or just shift side to side -- anything that moves",
         "meter_label": "head motion range",
         "meter_max": 0.12,
     },
     {
         "id": "mouth",
         "title": "Try opening your mouth",
-        "hint": "Open it wide once — like saying \"ah\"",
+        "hint": "Open it wide once -- like saying \"ah\"",
         "meter_label": "mouth opening",
         "meter_max": 0.25,
     },
     {
         "id": "blink",
         "title": "Try blinking both eyes",
-        "hint": "A firm, deliberate blink — close for a beat, then open",
+        "hint": "A firm, deliberate blink -- close for a beat, then open",
         "meter_label": "eye closure",
         "meter_max": 0.25,
     },
@@ -402,7 +424,7 @@ TESTS: list[dict[str, Any]] = [
     {
         "id": "hand",
         "title": "Try holding up your hand",
-        "hint": "Put your hand into the camera view — either hand, palm open",
+        "hint": "Put your hand into the camera view -- either hand, palm open",
         "meter_label": "hand in frame",
         "meter_max": 1.0,
     },
@@ -446,7 +468,7 @@ def _draw_welcome(frame, elapsed: float) -> None:
     _put_center(frame, "Adaptive control for your computer.", 315, 0.75,
                 fade(TEXT_SECONDARY), 1, font=FONT_LIGHT)
 
-    _put_center(frame, "I'll figure out how you like to interact —",
+    _put_center(frame, "I'll figure out how you like to interact --",
                 400, 0.7, fade(TEXT_SECONDARY), 1, font=FONT_LIGHT)
     _put_center(frame, "whatever you can do becomes your input.",
                 432, 0.7, fade(TEXT_SECONDARY), 1, font=FONT_LIGHT)
@@ -464,7 +486,7 @@ def _draw_test(frame, test: dict[str, Any], st: TestState, value: float,
     _draw_wordmark(frame, 60, 46)
     _draw_step_dots(frame, step_total, step_idx, y=44)
 
-    # Hero card — contains prompt, meter, chip.
+    # Hero card -- contains prompt, meter, chip.
     card_x0, card_y0 = 120, 130
     card_x1, card_y1 = DISPLAY_W - 120, 540
     _card(frame, card_x0, card_y0, card_x1, card_y1, radius=24, alpha=0.88)
@@ -552,12 +574,12 @@ def _draw_summary(frame, caps: dict[str, bool], proposed: list[dict[str, Any]],
     y = card_y0 + 84
     active = [b for b in proposed if b.get("enabled")]
     if not active:
-        _put(frame, "nothing detected — try again",
+        _put(frame, "nothing detected -- try again",
              (right_x0 + 28, y), 0.58, (170, 130, 130), 1, font=FONT_LIGHT)
     else:
         for b in active:
             desc = _describe_binding(b)
-            _put(frame, "•", (right_x0 + 32, y), 0.7, ACCENT_EMBER, 1)
+            _put(frame, ">", (right_x0 + 32, y), 0.7, ACCENT_EMBER, 1)
             _put(frame, desc, (right_x0 + 56, y), 0.58, TEXT_PRIMARY, 1)
             y += 34
 
@@ -576,7 +598,7 @@ def _read_live_signals(face_lms, hand_lms) -> dict[str, float]:
         out["mouth"] = float(mouth)
     ear = eye_aspect_ratio(face_lms, "both")
     if ear is not None:
-        # "eye closure" — higher when closed
+        # "eye closure" -- higher when closed
         out["blink"] = max(0.0, 0.3 - float(ear))
     brow = eyebrow_raise(face_lms)
     if brow is not None:
@@ -605,7 +627,7 @@ def _draw_explore(frame, signals: dict[str, float], elapsed: float) -> None:
     """Live meters for every movement Ember can track."""
     _draw_wordmark(frame, 60, 46)
     _put_center(frame, "Exploration", 110, 1.3, TEXT_PRIMARY, 1)
-    _put_center(frame, "Move anything you can — I'll show you what I see.",
+    _put_center(frame, "Move anything you can -- I'll show you what I see.",
                 146, 0.56, TEXT_SECONDARY, 1, font=FONT_LIGHT)
 
     card_x0, card_y0 = 120, 190
@@ -639,7 +661,7 @@ def _draw_converse(frame, agent: SetupAgent, elapsed_since_enter: float) -> None
     _draw_wordmark(frame, 60, 46)
     _put_center(frame, "Just talk to me", 110, 1.35, TEXT_PRIMARY, 1)
     _put_center(frame,
-                "Interrupt anytime  ·  say \"save it\" when you're done",
+                "Interrupt anytime  |  say \"save it\" when you're done",
                 146, 0.56, TEXT_SECONDARY, 1, font=FONT_LIGHT)
 
     # Mapping card on the left, speech bubble on the right.
@@ -650,7 +672,7 @@ def _draw_converse(frame, agent: SetupAgent, elapsed_since_enter: float) -> None
     right_x1 = DISPLAY_W - 60
     card_y0, card_y1 = 190, 540
 
-    # Left — current mapping
+    # Left -- current mapping
     _card(frame, left_x0, card_y0, left_x0 + card_w_left, card_y1, radius=22)
     _put(frame, "CURRENT MAPPING", (left_x0 + 28, card_y0 + 42),
          0.48, ACCENT_EMBER, 1, font=FONT_LIGHT)
@@ -661,16 +683,16 @@ def _draw_converse(frame, agent: SetupAgent, elapsed_since_enter: float) -> None
              0.58, TEXT_MUTED, 1, font=FONT_LIGHT)
     else:
         for b in active:
-            _put(frame, "•", (left_x0 + 32, y), 0.7, ACCENT_EMBER, 1)
+            _put(frame, ">", (left_x0 + 32, y), 0.7, ACCENT_EMBER, 1)
             _put(frame, _describe_binding(b),
                  (left_x0 + 56, y), 0.58, TEXT_PRIMARY, 1)
             y += 34
     if agent.draft.voice_enabled:
-        _put(frame, "•", (left_x0 + 32, y), 0.7, ACCENT_EMBER, 1)
+        _put(frame, ">", (left_x0 + 32, y), 0.7, ACCENT_EMBER, 1)
         _put(frame, "voice commands enabled",
              (left_x0 + 56, y), 0.58, TEXT_PRIMARY, 1)
 
-    # Right — agent speech bubble + pulsing mic
+    # Right -- agent speech bubble + pulsing mic
     _card(frame, right_x0, card_y0, right_x1, card_y1, radius=22)
     _put(frame, "EMBER", (right_x0 + 28, card_y0 + 42),
          0.48, ACCENT_EMBER, 1, font=FONT_LIGHT)
@@ -711,11 +733,11 @@ def _describe_binding(b: dict[str, Any]) -> str:
         "brow": "eyebrows", "index_tip": "finger",
     }.get(src, src)
     label_act = {
-        "cursor_xy": "→ move cursor",
-        "left_press": "→ click (hold to drag)",
-        "left_click": "→ click",
-        "right_click": "→ right-click",
-    }.get(act, f"→ {act}")
+        "cursor_xy": "-> move cursor",
+        "left_press": "-> click (hold to drag)",
+        "left_click": "-> click",
+        "right_click": "-> right-click",
+    }.get(act, f"-> {act}")
     return f"{label_src} {label_act}"
 
 
@@ -747,10 +769,10 @@ def _draw_summary_buttons(frame, confirm_progress: float, redo_progress: float) 
     y0 = DISPLAY_H - 110
     # Redo (left)
     _draw_button(frame, 60, y0, 60 + bw, y0 + bh, "Start over",
-                 "press R  ·  look left", redo_progress, ACCENT_WARN)
+                 "press R  |  look left", redo_progress, ACCENT_WARN)
     # Confirm (right)
     _draw_button(frame, DISPLAY_W - 60 - bw, y0, DISPLAY_W - 60, y0 + bh,
-                 "Looks good", "press Enter  ·  look right",
+                 "Looks good", "press Enter  |  look right",
                  confirm_progress, ACCENT_OK)
 
 
@@ -766,7 +788,7 @@ def _draw_summary_buttons_old(frame, confirm_progress: float, redo_progress: flo
         cv2.rectangle(frame, (bx + 10, by + bh - 14),
                       (bx + 10 + fill_w, by + bh - 8), (80, 240, 140), -1)
     cv2.putText(frame, "Looks good", (bx + 45, by + 35), FONT, 0.8, (220, 255, 220), 2, cv2.LINE_AA)
-    cv2.putText(frame, "Enter  •  hover right", (bx + 45, by + 58),
+    cv2.putText(frame, "Enter  >  hover right", (bx + 45, by + 58),
                 FONT, 0.45, (160, 200, 170), 1, cv2.LINE_AA)
 
     # Redo (R / look-left)
@@ -780,7 +802,7 @@ def _draw_summary_buttons_old(frame, confirm_progress: float, redo_progress: flo
         cv2.rectangle(frame, (rx + 10, ry + bh - 14),
                       (rx + 10 + fill_w, ry + bh - 8), (240, 180, 80), -1)
     cv2.putText(frame, "Redo setup", (rx + 45, ry + 35), FONT, 0.8, (255, 230, 180), 2, cv2.LINE_AA)
-    cv2.putText(frame, "R  •  hover left", (rx + 45, ry + 58),
+    cv2.putText(frame, "R  >  hover left", (rx + 45, ry + 58),
                 FONT, 0.45, (200, 180, 140), 1, cv2.LINE_AA)
 
 
@@ -790,7 +812,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
     """Run the guided setup. Returns the saved profile, or None on cancel.
 
     `mouse` is accepted for API compatibility with the older onboarding entry
-    point — this wizard does not touch the OS cursor.
+    point -- this wizard does not touch the OS cursor.
     `mapping_path` is ignored (profile goes to ~/.ember/profile.json).
     """
     _ = mouse
@@ -798,7 +820,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
 
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if not cap.isOpened():
-        print("onboarding: webcam unavailable — skipping", flush=True)
+        print("onboarding: webcam unavailable -- skipping", flush=True)
         return None
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
@@ -858,7 +880,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
 
             now = time.monotonic()
 
-            # Key poll — used per-phase.
+            # Key poll -- used per-phase.
             key = cv2.waitKey(1) & 0xFF
             if key == 27:  # Esc
                 print("onboarding: cancelled by user (Esc)", flush=True)
@@ -898,7 +920,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
                            step_idx=test_idx, step_total=len(TESTS))
 
                 # Advance: on timeout, OR on stable detection (give them a sec
-                # to see the ✓), OR on space-skip.
+                # to see the [ok]), OR on space-skip.
                 skip = key == 32  # space
                 linger_done = test_state.detected and elapsed > LINGER_AFTER_DETECT_S
                 if skip or linger_done or progress >= 1.0:
@@ -989,7 +1011,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
                     phase_start = now
                     continue
 
-                # ESC during conversation → drop to dwell-based summary so user
+                # ESC during conversation -> drop to dwell-based summary so user
                 # can still save without voice.
                 if key == 27:
                     agent.end()
@@ -1017,15 +1039,31 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
 
                 if agent.is_finished():
                     # Build the profile from the agent's final draft.
-                    result_profile = profile_mod.default_profile()
-                    result_profile["capabilities"] = {
-                        cid: bool(capabilities.get(cid, False))
-                        for cid in profile_mod.CAPABILITY_IDS
-                    }
+                    result_profile = profile_mod.from_capabilities(capabilities)
                     result_profile["bindings"] = agent.draft.bindings
                     result_profile["voice_enabled"] = agent.draft.voice_enabled
+                    # Merge in the agent-confirmed user abilities (fall back to
+                    # capability-based guesses if the agent didn't ask).
+                    abilities = result_profile.get("user_abilities", {})
+                    if agent.draft.can_see is not None:
+                        abilities["can_see"] = bool(agent.draft.can_see)
+                    if agent.draft.can_hear is not None:
+                        abilities["can_hear"] = bool(agent.draft.can_hear)
+                    abilities["confirmed"] = agent.draft.abilities_confirmed
+                    result_profile["user_abilities"] = abilities
+                    # If the user said they can't see, force narration on; if
+                    # they said they can't hear, force TTS off.
+                    prefs = result_profile.get("preferences", {})
+                    if abilities.get("can_see") is False:
+                        prefs["narration_enabled"] = True
+                        prefs["voice_control"] = True
+                        prefs["auto_wake"] = True
+                    if abilities.get("can_hear") is False:
+                        prefs["tts_enabled"] = False
+                        prefs["narration_enabled"] = False
+                    result_profile["preferences"] = prefs
                     profile_mod.save(result_profile)
-                    print(f"onboarding: profile saved → {profile_mod.PROFILE_PATH}", flush=True)
+                    print(f"onboarding: profile saved -> {profile_mod.PROFILE_PATH}", flush=True)
                     agent = None
                     narrator = Narrator()
                     narrator.start()
@@ -1044,7 +1082,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
                 _draw_explore(display, signals, now - explore_start)
 
                 # Exit on Esc or if the agent ended (e.g. user said "done" and
-                # agent called no more tools) — actually the agent stays alive
+                # agent called no more tools) -- actually the agent stays alive
                 # during exploration. Exit on Esc only, or after 45s timeout.
                 if key == 27 or (now - explore_start) > 45:
                     phase = "converse" if agent is not None else "summary"
@@ -1083,7 +1121,7 @@ def run(mouse=None, mapping_path: Path | None = None) -> dict[str, Any] | None:
                 if confirm_key or conf_prog >= 1.0:
                     result_profile = profile_mod.from_capabilities(capabilities)
                     profile_mod.save(result_profile)
-                    print(f"onboarding: profile saved → {profile_mod.PROFILE_PATH}", flush=True)
+                    print(f"onboarding: profile saved -> {profile_mod.PROFILE_PATH}", flush=True)
                     narrator.say("Great. Ember is ready.")
                     phase = "done"
                     phase_start = now

@@ -32,15 +32,124 @@ CAPABILITY_IDS = [
 ]
 
 
+# ---- Interaction-mode inference -------------------------------------------
+#
+# The mode describes how the user PREFERS to interact, not just what they
+# physically can do. Voice-first users (likely blind or severely motor
+# impaired) need screen narration + voice command execution. Visual-only
+# users (likely deaf) should never rely on TTS. "Full" means everything.
+
+INTERACTION_MODES = ("full", "voice_first", "visual_only", "motor_limited")
+
+
+def infer_mode(caps: dict[str, bool]) -> str:
+    """Derive primary interaction mode from detected capabilities.
+
+    Heuristics (intentionally simple, erring toward the more accessible mode):
+      - voice=yes, no face/hand signals → voice_first (likely blind or motor)
+      - voice=no, any visible input signal → visual_only (likely deaf)
+      - voice=yes AND any visual input → full
+      - otherwise (weak signals all around) → motor_limited
+    """
+    has_voice = bool(caps.get("voice"))
+    has_visual = any(caps.get(k) for k in ("head", "mouth", "blink", "brow", "hand"))
+    has_keyboard = bool(caps.get("keyboard"))
+
+    if has_voice and not has_visual:
+        return "voice_first"
+    if not has_voice and has_visual:
+        return "visual_only"
+    if has_voice and has_visual:
+        return "full"
+    if has_keyboard:
+        return "motor_limited"
+    return "motor_limited"
+
+
+def mode_preferences(mode: str) -> dict[str, Any]:
+    """Preferences derived from a mode.
+
+    These drive runtime behavior:
+      - narration_enabled: agent describes screen changes aloud
+      - tts_enabled:       use speech output (off for deaf users)
+      - voice_control:     agent accepts commands like "open firefox"
+      - auto_wake:         ElevenLabs session auto-starts on launch
+    """
+    if mode == "voice_first":
+        return {
+            "narration_enabled": True,
+            "tts_enabled": True,
+            "voice_control": True,
+            "auto_wake": True,
+        }
+    if mode == "visual_only":
+        return {
+            "narration_enabled": False,
+            "tts_enabled": False,
+            "voice_control": False,
+            "auto_wake": False,
+        }
+    if mode == "full":
+        # Always-on voice help by default -- user may need to ask Ember a
+        # question at any moment while working. Set auto_wake:false in
+        # profile.json to require a wake gesture/key instead.
+        return {
+            "narration_enabled": False,
+            "tts_enabled": True,
+            "voice_control": True,
+            "auto_wake": True,
+        }
+    # motor_limited
+    return {
+        "narration_enabled": False,
+        "tts_enabled": True,
+        "voice_control": True,
+        "auto_wake": True,
+    }
+
+
+def default_abilities() -> dict[str, Any]:
+    """User-self-reported abilities. Inferred from capabilities initially,
+    overridden by the agent asking directly during setup.
+
+    can_see / can_hear / can_speak / can_type each: True, False, or None
+    (meaning unknown / not asked). The agent fills these in during setup
+    so the runtime behavior can adapt (e.g. narrate screen for can_see=False).
+    `confirmed` flips true once the agent has asked at least the vision and
+    hearing questions -- before that the values are just guesses.
+    """
+    return {
+        "can_see": None,
+        "can_hear": None,
+        "can_speak": None,
+        "can_type": None,
+        "confirmed": False,
+    }
+
+
+def abilities_from_capabilities(caps: dict[str, bool]) -> dict[str, Any]:
+    """Best-guess abilities from raw capability detection."""
+    return {
+        "can_see": True,  # default assumption -- agent asks to confirm
+        "can_hear": True,
+        "can_speak": bool(caps.get("voice")),
+        "can_type": bool(caps.get("keyboard")),
+        "confirmed": False,
+    }
+
+
 def default_profile() -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "capabilities": {cid: False for cid in CAPABILITY_IDS},
         "bindings": [],
         "cursor_sensitivity": 4000,
         "filter": {"min_cutoff": 1.0, "beta": 0.05},
         "voice_enabled": False,
+        "interaction_mode": "full",
+        "preferences": mode_preferences("full"),
+        "user_abilities": default_abilities(),
     }
 
 
@@ -140,4 +249,19 @@ def from_capabilities(caps: dict[str, bool]) -> dict[str, Any]:
     prof["capabilities"] = {cid: bool(caps.get(cid, False)) for cid in CAPABILITY_IDS}
     prof["bindings"] = bindings_from_capabilities(prof["capabilities"])
     prof["voice_enabled"] = bool(caps.get("voice", False))
+    prof["user_abilities"] = abilities_from_capabilities(prof["capabilities"])
+    mode = infer_mode(prof["capabilities"])
+    prof["interaction_mode"] = mode
+    prefs = mode_preferences(mode)
+    # Key refinement: if the user has voice but cannot type by hand (no
+    # keyboard detected), voice IS their keyboard. Auto-start the voice
+    # session so they never have to press a key to activate it. Someone
+    # who can only tilt their head + open their mouth needs this.
+    can_type_by_hand = bool(caps.get("keyboard"))
+    if caps.get("voice") and not can_type_by_hand:
+        prefs["auto_wake"] = True
+        prefs["voice_control"] = True
+    prof["preferences"] = prefs
+    if prof["preferences"].get("voice_control"):
+        prof["voice_enabled"] = True
     return prof

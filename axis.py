@@ -186,6 +186,13 @@ def main() -> None:
     want_voice = voice_wanted(args, profile)
     voice_thread: threading.Thread | None = None
     if want_voice:
+        # If the profile prefers voice-first (blind / motor-limited / keyboard-
+        # less), auto-start + auto-restart the conversation so the user never
+        # has to press a key to wake it.
+        prefs = (profile or {}).get("preferences", {})
+        if prefs.get("auto_wake"):
+            os.environ["EMBER_VOICE_AUTO_WAKE"] = "1"
+            print("voice: auto-wake enabled (user needs hands-free voice access)", flush=True)
         try:
             from cursor import VirtualMouse
             voice_mouse = VirtualMouse()

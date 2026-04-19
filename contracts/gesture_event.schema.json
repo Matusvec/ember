@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GestureEvent",
+  "description": "Single gesture event emitted by the Signal pipeline (Team 1) and consumed by the Driver runtime (Team 2). Sent over the local WebSocket and also replayable from fixtures/mock_gestures.jsonl.",
+  "type": "object",
+  "required": ["gesture_id", "type", "value", "timestamp"],
+  "properties": {
+    "gesture_id": {
+      "type": "string",
+      "description": "Stable identifier. Must match an id listed in profile.json. Examples: head_tilt_left, head_tilt_right, head_pitch_up, head_pitch_down, smile, brow_raise, jaw_open, blink_left, blink_right.",
+      "examples": ["head_tilt_left", "smile", "brow_raise"]
+    },
+    "type": {
+      "enum": ["analog", "discrete", "dwell"],
+      "description": "analog: continuous signal in value, emitted every frame while active. discrete: one-shot edge event (gesture fired). dwell: cursor held still for value milliseconds."
+    },
+    "value": {
+      "type": "number",
+      "description": "analog: signed magnitude in [-1.0, 1.0]. discrete: 0 (off) or 1 (on). dwell: milliseconds held."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Classifier confidence. Runtime may drop events below a threshold."
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "Monotonic seconds since pipeline start. Use time.monotonic() on the Python side."
+    }
+  },
+  "additionalProperties": false
+}

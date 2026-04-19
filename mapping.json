@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "cursor_sensitivity": 4000,
+  "filter": {
+    "min_cutoff": 1.0,
+    "beta": 0.05
+  },
+  "bindings": [
+    {
+      "id": "head_cursor",
+      "source": "nose",
+      "action": "cursor_xy",
+      "enabled": true,
+      "invert_x": false,
+      "invert_y": false
+    },
+    {
+      "id": "mouth_click",
+      "source": "mouth",
+      "action": "left_press",
+      "enabled": true,
+      "threshold": 0.08
+    },
+    {
+      "id": "blink_click",
+      "source": "blink",
+      "action": "left_click",
+      "enabled": false,
+      "ear_threshold": 0.18,
+      "min_closed_ms": 200
+    },
+    {
+      "id": "brow_click",
+      "source": "brow",
+      "action": "left_click",
+      "enabled": false,
+      "threshold": 0.06
+    },
+    {
+      "id": "finger_cursor",
+      "source": "index_tip",
+      "action": "cursor_xy",
+      "enabled": false,
+      "invert_x": false,
+      "invert_y": false
+    }
+  ]
+}

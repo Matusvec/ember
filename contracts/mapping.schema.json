@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mapping",
+  "description": "User-defined bindings from gesture_id to OS action. Written by the mapping UI (Team 2), read live by the runtime.",
+  "type": "object",
+  "required": ["bindings"],
+  "properties": {
+    "bindings": {
+      "type": "object",
+      "description": "Keys are gesture_ids from profile.json. Values are the action to fire.",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+              "action": {
+                "enum": [
+                  "cursor_x_positive",
+                  "cursor_x_negative",
+                  "cursor_y_positive",
+                  "cursor_y_negative",
+                  "left_click",
+                  "right_click",
+                  "scroll_up",
+                  "scroll_down"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["action", "key"],
+            "properties": {
+              "action": { "const": "keypress" },
+              "key": {
+                "type": "string",
+                "description": "Linux input-event key name, e.g. KEY_SPACE, KEY_ENTER, KEY_LEFTCTRL."
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

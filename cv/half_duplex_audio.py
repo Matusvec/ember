@@ -8,7 +8,9 @@ Defense layers:
      EMBER_SPEAK_TAIL_S seconds so speaker reverb + room echo decay.
   3. interrupt() clears both — ElevenLabs calls it when the user barges in.
 
-Tuning: EMBER_SPEAK_TAIL_S (default 1.8s). Bump to 2.5+ on loud speakers.
+Tuning: EMBER_SPEAK_TAIL_S (default 0.5s). Bump to 1.5-2.5 on loud speakers
+in echoey rooms where the agent still hears itself; drop lower only if users
+complain they can't interrupt fast enough.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ def _env_float(name: str, default: float) -> float:
 
 class HalfDuplexAudioInterface(DefaultAudioInterface):
 
-    SPEAK_TAIL_S = _env_float("EMBER_SPEAK_TAIL_S", 1.8)
+    SPEAK_TAIL_S = _env_float("EMBER_SPEAK_TAIL_S", 0.5)
 
     def __init__(self) -> None:
         super().__init__()

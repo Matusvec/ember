@@ -61,9 +61,10 @@ def _fetch_agent_tool_ids() -> list[str]:
 
 
 def _make_audio_interface():
-    """Default full-duplex. Echo suppression is handled server-side on the
-    agent via `vad.background_voice_detection=true`. EMBER_AUDIO=half-duplex
-    forces the code-level mic-gate fallback if ever needed."""
+    """Default is half-duplex: mic gated while TTS plays plus EMBER_SPEAK_TAIL_S
+    tail (0.5s by default) so the agent cannot transcribe its own speech.
+    Set EMBER_AUDIO=default to fall back to DefaultAudioInterface — only safe
+    when the agent has vad.background_voice_detection=true on the server."""
     mode = os.getenv("EMBER_AUDIO", "half-duplex").lower()
     if mode == "default":
         return DefaultAudioInterface()

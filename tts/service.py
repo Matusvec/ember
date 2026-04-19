@@ -28,7 +28,7 @@ _client: Optional[AsyncElevenLabs] = None
 def get_client() -> AsyncElevenLabs:
     global _client
     if _client is None:
-        api_key = os.getenv("sk_cacfb86445e65d49434984773eeed5a98dc04a81a4bf0cdb")
+        api_key = os.getenv("ELEVENLABS_API_KEY")
         if not api_key:
             raise EnvironmentError(
                 "ELEVENLABS_API_KEY is not set. "
@@ -66,26 +66,19 @@ async def synthesize(text: str) -> bytes:
     Returns full MP3 audio bytes for `text`.
     Checks local disk cache first — cached phrases (calibration steps,
     status messages) never hit the API twice.
+
+    Internally collects from synthesize_stream() so there is no blocking
+    isinstance / sync-generator path that could stall the event loop.
     """
     cache_path = _cache_key(text, VOICE_ID, MODEL_ID)
     cached = await _load_cache(cache_path)
     if cached:
         return cached
 
-    client = get_client()
-    audio_bytes = await client.text_to_speech.convert(
-        text=text,
-        voice_id=VOICE_ID,
-        model_id=MODEL_ID,
-        output_format="mp3_44100_128",
-    )
-
-    # ElevenLabs async convert returns bytes directly
-    if isinstance(audio_bytes, bytes):
-        data = audio_bytes
-    else:
-        # handle generator fallback
-        data = b"".join([chunk async for chunk in audio_bytes])  # type: ignore
+    chunks: list[bytes] = []
+    async for chunk in synthesize_stream(text):
+        chunks.append(chunk)
+    data = b"".join(chunks)
 
     await _save_cache(cache_path, data)
     return data

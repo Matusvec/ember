@@ -1,15 +1,30 @@
 # axis/main.py  (integration snippet — merge with your existing main.py)
 #
-# 1. pip install elevenlabs fastapi uvicorn
-# 2. Add ELEVENLABS_API_KEY to your .env
-# 3. Include the router as shown below
+# 1. pip install elevenlabs fastapi uvicorn python-dotenv
+# 2. cp .env.example .env  →  fill in ELEVENLABS_API_KEY
+# 3. Integrate as shown below
+
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+load_dotenv()   # must run before any tts/ import reads os.getenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from tts import tts_router   # adjust import path to match your project layout
+from tts.router import tts_router, tts_startup
 
-app = FastAPI(title="Axis")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Kick off background pre-warm of all known TTS phrases.
+    # Replaces the deprecated on_event("startup") pattern.
+    await tts_startup()
+    yield
+    # (add any shutdown logic here if needed)
+
+
+app = FastAPI(title="Axis", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

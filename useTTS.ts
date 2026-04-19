@@ -8,6 +8,53 @@ import { useCallback, useEffect, useRef } from "react";
 
 const API_BASE = "http://localhost:8000/tts";
 
+// ─── Shared audio singleton ──────────────────────────────────────────────────
+//
+// Module-level so both useTTS() and useTTSStatusSocket() share one audio
+// context. Calling stop() from either hook cancels audio from the other,
+// and there is never more than one clip playing at a time.
+
+let _currentAudio: HTMLAudioElement | null = null;
+let _currentUrl: string | null = null;
+
+function _playBlob(blob: Blob): void {
+    // Stop and release whatever is currently playing
+    if (_currentAudio) {
+        _currentAudio.pause();
+        _currentAudio = null;
+    }
+    if (_currentUrl) {
+        URL.revokeObjectURL(_currentUrl);
+        _currentUrl = null;
+    }
+
+    const url = URL.createObjectURL(blob);
+    _currentUrl = url;
+    const audio = new Audio(url);
+    _currentAudio = audio;
+
+    audio.play().catch(() => {
+        // Browsers may block autoplay without prior user interaction.
+        // In Axis this is fine — the user's first gesture satisfies the policy.
+    });
+    audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (_currentUrl === url) _currentUrl = null;
+        if (_currentAudio === audio) _currentAudio = null;
+    };
+}
+
+function _stopAudio(): void {
+    if (_currentAudio) {
+        _currentAudio.pause();
+        _currentAudio = null;
+    }
+    if (_currentUrl) {
+        URL.revokeObjectURL(_currentUrl);
+        _currentUrl = null;
+    }
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type CalibrationStep =
@@ -41,27 +88,6 @@ export interface DetectedInput {
 // ─── Hook ───────────────────────────────────────────────────────────────────
 
 export function useTTS() {
-    const audioRef = useRef<HTMLAudioElement | null>(null);
-
-    // ── Core player ────────────────────────────────────────────────────────
-
-    const playBlob = useCallback((blob: Blob) => {
-        // Stop anything currently playing before starting the new clip
-        if (audioRef.current) {
-            audioRef.current.pause();
-            URL.revokeObjectURL(audioRef.current.src);
-        }
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        audioRef.current = audio;
-        audio.play().catch(() => {
-            // Browsers may block autoplay without prior user interaction.
-            // In Axis this is fine because the user always triggers the first
-            // action via a gesture, satisfying the autoplay policy.
-        });
-        audio.onended = () => URL.revokeObjectURL(url);
-    }, []);
-
     const fetchAndPlay = useCallback(
         async (endpoint: string, body: object) => {
             try {
@@ -72,12 +98,12 @@ export function useTTS() {
                 });
                 if (!res.ok) return;
                 const blob = await res.blob();
-                playBlob(blob);
+                _playBlob(blob);
             } catch (err) {
                 console.warn("[useTTS] fetch failed:", err);
             }
         },
-        [playBlob]
+        []
     );
 
     // ── Public API ─────────────────────────────────────────────────────────
@@ -124,17 +150,10 @@ export function useTTS() {
         [fetchAndPlay]
     );
 
-    /** Stop whatever is currently playing. */
-    const stop = useCallback(() => {
-        if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current = null;
-        }
-    }, []);
+    /** Stop whatever is currently playing and release the blob URL. */
+    const stop = useCallback(() => _stopAudio(), []);
 
-    // ── Cleanup on unmount ─────────────────────────────────────────────────
-
-    useEffect(() => () => stop(), [stop]);
+    useEffect(() => () => _stopAudio(), []);
 
     return {
         speak,
@@ -152,56 +171,34 @@ export function useTTS() {
 //
 // Connect this in your gesture driver UI component to get real-time
 // audio feedback pushed from the backend as gesture events fire.
+// Uses the same shared audio singleton as useTTS() — stop() from either
+// hook cancels audio from the other.
 
 export function useTTSStatusSocket() {
-    const { playBlob } = useTTSInternal();
     const wsRef = useRef<WebSocket | null>(null);
 
     useEffect(() => {
         const ws = new WebSocket("ws://localhost:8000/tts/ws/status");
         wsRef.current = ws;
-
         ws.binaryType = "arraybuffer";
 
         ws.onmessage = (e) => {
             if (e.data instanceof ArrayBuffer) {
-                const blob = new Blob([e.data], { type: "audio/mpeg" });
-                playBlob(blob);
+                _playBlob(new Blob([e.data], { type: "audio/mpeg" }));
             }
         };
 
         ws.onerror = (e) => console.warn("[useTTSStatusSocket] WS error:", e);
 
         return () => ws.close();
-    }, [playBlob]);
+    }, []);
 
     /** Send a status event from the frontend (e.g. after gesture engine fires). */
-    const emitStatus = useCallback(
-        (event: StatusEvent) => {
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({ event }));
-            }
-        },
-        []
-    );
+    const emitStatus = useCallback((event: StatusEvent) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ event }));
+        }
+    }, []);
 
     return { emitStatus };
-}
-
-// Internal helper so useTTSStatusSocket can share the same playBlob logic
-// without duplicating the audioRef pattern.
-function useTTSInternal() {
-    const audioRef = useRef<HTMLAudioElement | null>(null);
-    const playBlob = useCallback((blob: Blob) => {
-        if (audioRef.current) {
-            audioRef.current.pause();
-            URL.revokeObjectURL(audioRef.current.src);
-        }
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        audioRef.current = audio;
-        audio.play().catch(() => { });
-        audio.onended = () => URL.revokeObjectURL(url);
-    }, []);
-    return { playBlob };
 }

@@ -22,7 +22,6 @@ from .voice_guide import (
     PHRASES,
     announce_detected_inputs,
     announce_mapping,
-    announce_tts_output,
 )
 
 tts_router = APIRouter(tags=["tts"])
@@ -138,9 +137,8 @@ async def speak_aac(req: AACRequest):
     """
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text must not be empty")
-    text = announce_tts_output(req.text)
     return StreamingResponse(
-        synthesize_stream(text),
+        synthesize_stream(req.text),
         media_type="audio/mpeg",
         headers={"Cache-Control": "no-cache"},
     )
@@ -184,20 +182,30 @@ async def tts_status_ws(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Startup pre-warm
+# Startup pre-warm — call this from your app's lifespan, not on_event
 # ---------------------------------------------------------------------------
+# on_event("startup") is deprecated in FastAPI >= 0.93.
+# In main.py, wire it like this:
+#
+#   from contextlib import asynccontextmanager
+#   from tts.router import tts_startup
+#
+#   @asynccontextmanager
+#   async def lifespan(app: FastAPI):
+#       await tts_startup()
+#       yield
+#
+#   app = FastAPI(lifespan=lifespan)
 
-@tts_router.on_event("startup")
-async def startup_prewarm():
+async def tts_startup() -> None:
     """
-    Called when the FastAPI app starts. Generates and caches every known
-    phrase so all in-session TTS responses are served from disk, not the API.
-    Runs in the background so it does not block app startup.
+    Kick off background phrase pre-warming.
+    Call once from your app lifespan before yielding.
     """
     asyncio.create_task(_prewarm_task())
 
 
-async def _prewarm_task():
+async def _prewarm_task() -> None:
     try:
         print("[TTS] Pre-warming phrase cache...")
         await prewarm(PHRASES)

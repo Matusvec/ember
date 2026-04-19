@@ -141,13 +141,6 @@ def announce_mapping(gesture: str, action: str) -> str:
     return f"{gesture.capitalize()} mapped to {action}."
 
 
-def announce_tts_output(text: str) -> str:
-    """
-    Pass-through — text from an AAC input event is spoken as-is.
-    """
-    return text
-
-
 # ---------------------------------------------------------------------------
 # Master phrase list — feed to service.prewarm() at startup
 # ---------------------------------------------------------------------------
